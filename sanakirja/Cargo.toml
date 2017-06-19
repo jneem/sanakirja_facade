@@ -1,0 +1,20 @@
+[package]
+name = "sanakirja"
+description = "A key-value dictionary, using copy-on-write and B trees."
+version = "0.8.9"
+authors = ["Pierre-Étienne Meunier", "Florent Becker"]
+license = "MIT/Apache-2.0"
+documentation = "https://docs.rs/sanakirja"
+repository = "https://nest.pijul.com/pijul_org/sanakirja"
+include = ["Cargo.toml", "src/del.rs", "src/lib.rs", "src/put.rs", "src/skiplist.rs", "src/tests.rs", "src/transaction.rs","src/value.rs"]
+
+[dependencies]
+fs2="0.4"
+log="0.3"
+memmap = "0.5"
+rand="0.3"
+rustc-serialize = "0.3"
+
+[dev-dependencies]
+env_logger="0.4"
+tempdir="0.3"
