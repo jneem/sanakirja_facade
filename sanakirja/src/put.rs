@@ -15,7 +15,7 @@ use skiplist;
 use std;
 use rand::Rng;
 
-impl<'env, T> MutTxn<'env, T> {
+impl<'env> MutTxn<'env> {
     /// Insert a binding to a database, returning `false` if and only
     /// if the exact same binding (key *and* value) was already in the database.
     pub fn put<R: Rng, K: Representable, V: Representable>(&mut self,

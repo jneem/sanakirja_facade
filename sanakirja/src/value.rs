@@ -98,7 +98,7 @@ impl Representable for UnsafeValue {
         x.cmp(y)
     }
 
-    fn drop_value<T, R>(&self, txn: &mut MutTxn<T>, _: &mut R) -> Result<(), super::Error> {
+    fn drop_value<R>(&self, txn: &mut MutTxn, _: &mut R) -> Result<(), super::Error> {
         match *self {
             UnsafeValue::Large { mut offset, mut len } => {
                 debug!("drop value {:?} {:?}", offset, len);
@@ -263,7 +263,7 @@ impl UnsafeValue {
     }
 
     /// Allocates a large value if needed, or else return a pointer to the given slice.
-    pub fn alloc_if_needed<T>(txn: &mut MutTxn<T>,
+    pub fn alloc_if_needed(txn: &mut MutTxn,
                               value: &[u8])
                               -> Result<UnsafeValue, super::Error> {
         if value.len() > MAX_INLINE_SIZE as usize {
@@ -279,7 +279,7 @@ impl UnsafeValue {
     /// Allocate an unsafe large value. This function always allocate
     /// and returns `UnsafeValue::Large`, no matter what it receives
     /// as input
-    fn alloc_large<T>(txn: &mut MutTxn<T>, value: &[u8]) -> Result<UnsafeValue, super::Error> {
+    fn alloc_large(txn: &mut MutTxn, value: &[u8]) -> Result<UnsafeValue, super::Error> {
         debug!("alloc_value");
         let mut len = value.len();
         let mut p_value = value.as_ptr();

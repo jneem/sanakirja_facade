@@ -131,10 +131,10 @@ pub struct Txn<'env> {
 }
 
 /// A mutable transaction.
-pub struct MutTxn<'env, T> {
+pub struct MutTxn<'env> {
     env: &'env Env,
     mutable: Option<MutexGuard<'env, ()>>,
-    parent: T,
+    parent: Option<Box<MutTxn<'env>>>,
 
     /// The offset from the beginning of the file, of the first free
     /// page at the end of the file. Note that there might be other
@@ -170,7 +170,7 @@ impl<'env> Drop for Txn<'env> {
         *self.guard;
     }
 }
-impl<'env, T> Drop for MutTxn<'env, T> {
+impl<'env> Drop for MutTxn<'env> {
     fn drop(&mut self) {
         debug!("dropping transaction");
         if let Some(ref mut guard) = self.mutable {
@@ -273,7 +273,7 @@ impl Env {
 
     /// Start a mutable transaction. Mutable transactions that go out
     /// of scope are automatically aborted.
-    pub fn mut_txn_begin<'env>(&'env self) -> Result<MutTxn<'env, ()>, Error> {
+    pub fn mut_txn_begin<'env>(&'env self) -> Result<MutTxn<'env>, Error> {
         unsafe {
             let last_page = u64::from_le(*((self.map as *const u64).offset(OFF_MAP_LENGTH)));
             let current_list_page = u64::from_le(*((self.map as *const u64)
@@ -295,7 +295,7 @@ impl Env {
             Ok(MutTxn {
                 env: self,
                 mutable: Some(guard),
-                parent: (),
+                parent: None,
                 last_page: if last_page == 0 {
                     PAGE_SIZE_64
                 } else {
@@ -384,6 +384,7 @@ impl MutPage {
 #[doc(hidden)]
 pub trait LoadPage {
     fn load_page(&self, off: u64) -> Page;
+    fn len(&self) -> u64;
     fn root_(&self, num: usize) -> u64;
 }
 
@@ -399,6 +400,11 @@ impl<'env> LoadPage for Txn<'env> {
             }
         }
     }
+
+    fn len(&self) -> u64 {
+        self.env.length
+    }
+
     fn root_(&self, num: usize) -> u64 {
         assert!(ZERO_HEADER as usize + ((num + 1) << 3) < PAGE_SIZE);
         unsafe {
@@ -408,7 +414,7 @@ impl<'env> LoadPage for Txn<'env> {
 }
 
 
-impl<'env, A> LoadPage for MutTxn<'env, A> {
+impl<'env> LoadPage for MutTxn<'env> {
     fn load_page(&self, off: u64) -> Page {
         if off >= self.env.length {
             panic!("{:?} >= {:?}", off, self.env.length)
@@ -420,6 +426,11 @@ impl<'env, A> LoadPage for MutTxn<'env, A> {
             }
         }
     }
+
+    fn len(&self) -> u64 {
+        self.env.length
+    }
+
     fn root_(&self, num: usize) -> u64 {
         if let Some(root) = self.roots.get(&num) {
             *root
@@ -454,30 +465,28 @@ impl Cow {
     }
 }
 
-impl<'env, T> MutTxn<'env, T> {
+impl<'env> MutTxn<'env> {
     /// Start a mutable transaction.
-    pub fn mut_txn_begin<'txn>(&'txn mut self)
-                               -> Result<MutTxn<'env, &'txn mut MutTxn<'env, T>>, Error> {
-        unsafe {
-            let mut txn = MutTxn {
-                env: self.env,
-                mutable: None,
-                parent: std::mem::uninitialized(),
-                last_page: self.last_page,
-                current_list_page: Page {
-                    data: self.current_list_page.data,
-                    offset: self.current_list_page.offset,
-                },
-                current_list_length: self.current_list_length,
-                current_list_position: self.current_list_position,
-                occupied_clean_pages: HashSet::new(),
-                free_clean_pages: Vec::new(),
-                free_pages: Vec::new(),
-                roots: self.roots.clone(), // reference_counts:self.reference_counts
-            };
-            txn.parent = self;
-            Ok(txn)
-        }
+    pub fn mut_txn_begin<'txn>(self)
+                               -> Result<MutTxn<'env>, Error> {
+        let mut txn = MutTxn {
+            env: self.env,
+            mutable: None,
+            parent: None,
+            last_page: self.last_page,
+            current_list_page: Page {
+                data: self.current_list_page.data,
+                offset: self.current_list_page.offset,
+            },
+            current_list_length: self.current_list_length,
+            current_list_position: self.current_list_position,
+            occupied_clean_pages: HashSet::new(),
+            free_clean_pages: Vec::new(),
+            free_pages: Vec::new(),
+            roots: self.roots.clone(), // reference_counts:self.reference_counts
+        };
+        txn.parent = Some(Box::new(self));
+        Ok(txn)
     }
 
     #[doc(hidden)]
@@ -610,6 +619,7 @@ pub trait Commit {
     fn commit(self) -> Result<(), Error>;
 }
 
+/*
 impl<'a, 'env, T> Commit for MutTxn<'env, &'a mut MutTxn<'env, T>> {
     fn commit(mut self) -> Result<(), Error> {
 
@@ -629,8 +639,9 @@ impl<'a, 'env, T> Commit for MutTxn<'env, &'a mut MutTxn<'env, T>> {
         Ok(())
     }
 }
+*/
 
-impl<'env> Commit for MutTxn<'env, ()> {
+impl<'env> Commit for MutTxn<'env> {
     /// Commit a transaction. This is guaranteed to be atomic: either
     /// the commit succeeds, and all the changes made during the
     /// transaction are written to disk. Or the commit doesn't

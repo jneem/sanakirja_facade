@@ -30,8 +30,7 @@
 //! retrieve the first one).
 //!
 
-#![deny(missing_docs,
-        trivial_casts, trivial_numeric_casts,
+#![deny(trivial_casts, trivial_numeric_casts,
         unused_import_braces, unused_qualifications)]
 
 extern crate rand;
@@ -45,13 +44,13 @@ extern crate memmap;
 
 mod transaction;
 
-pub use transaction::{Txn, MutTxn, Env, Commit};
-use transaction::{MutPage, Page, Cow};
+pub use transaction::{Txn, MutTxn, Env, Commit, Page};
+use transaction::{MutPage, Cow};
 use skiplist::SkipCursor;
 use rand::Rng;
 /// A database is a skip list of (page offset, key, value).
 #[derive(Clone, Copy, Debug)]
-pub struct Db<K: Representable, V: Representable>(u64, std::marker::PhantomData<(K, V)>);
+pub struct Db<K: Representable, V: Representable>(pub u64, std::marker::PhantomData<(K, V)>);
 
 /// Values, which might be either inlined on the page, or stored as a reference if too large.
 pub mod value;
@@ -115,7 +114,7 @@ pub trait Representable: Copy + std::fmt::Debug {
     /// How to free the pages used by this value. The default
     /// implementation doesn't do anything, which is fine for types
     /// stored directly on B tree pages.
-    fn drop_value<T,R:Rng>(&self, _: &mut MutTxn<T>, _:&mut R) -> Result<(), Error> { Ok(()) }
+    fn drop_value<R:Rng>(&self, _: &mut MutTxn, _:&mut R) -> Result<(), Error> { Ok(()) }
 
     /// If this value is an offset to another page at offset `offset`,
     /// return `Some(offset)`. Return `None` else.
@@ -178,7 +177,7 @@ impl<A:Representable, B:Representable> Representable for (A, B) {
         self.0.page_offsets().chain(self.1.page_offsets())
     }
 
-    fn drop_value<T, R:Rng>(&self, txn: &mut MutTxn<T>, rng: &mut R) -> Result<(), Error> {
+    fn drop_value<R:Rng>(&self, txn: &mut MutTxn, rng: &mut R) -> Result<(), Error> {
         try!(self.0.drop_value(txn, rng));
         try!(self.1.drop_value(txn, rng));
         Ok(())
@@ -262,7 +261,7 @@ impl<A:Representable, B:Representable, C:Representable> Representable for (A, B,
         self.0.page_offsets().chain(self.1.page_offsets()).chain(self.2.page_offsets())
     }
 
-    fn drop_value<T, R:Rng>(&self, txn: &mut MutTxn<T>, rng: &mut R) -> Result<(), Error> {
+    fn drop_value<R:Rng>(&self, txn: &mut MutTxn, rng: &mut R) -> Result<(), Error> {
         try!(self.0.drop_value(txn, rng));
         try!(self.1.drop_value(txn, rng));
         try!(self.2.drop_value(txn, rng));
@@ -379,7 +378,7 @@ impl<A:Representable, B:Representable, C:Representable, D:Representable> Represe
             .chain(self.2.page_offsets().chain(self.3.page_offsets()))
     }
 
-    fn drop_value<T, R:Rng>(&self, txn: &mut MutTxn<T>, rng: &mut R) -> Result<(), Error> {
+    fn drop_value<R:Rng>(&self, txn: &mut MutTxn, rng: &mut R) -> Result<(), Error> {
         try!(self.0.drop_value(txn, rng));
         try!(self.1.drop_value(txn, rng));
         try!(self.2.drop_value(txn, rng));
@@ -544,7 +543,7 @@ impl<K:Representable, V:Representable> Representable for Db<K,V> {
     fn page_offsets(&self) -> Self::PageOffsets {
         std::iter::once(self.0)
     }
-    fn drop_value<T, R:Rng>(&self, txn: &mut MutTxn<T>, rng: &mut R) -> Result<(), Error> {
+    fn drop_value<R:Rng>(&self, txn: &mut MutTxn, rng: &mut R) -> Result<(), Error> {
         txn.drop(rng, self)
     }
 }
@@ -683,7 +682,7 @@ impl CursorStack {
 
 /// An iterator over a database.
 #[derive(Clone)]
-pub struct Cursor<'a, T: Transaction + 'a, K, V> {
+pub struct Cursor<'a, T: LoadPage + 'a, K, V> {
     txn: &'a T,
     stack: CursorStack,
     marker: std::marker::PhantomData<(K, V)>,
@@ -884,7 +883,7 @@ pub use del::*;
 const RC_ROOT: usize = 0;
 
 
-impl<'env, T> MutTxn<'env, T> {
+impl<'env> MutTxn<'env> {
     /// Creates a new database, complexity O(1).
     pub fn create_db<K: Representable, V: Representable>(&mut self) -> Result<Db<K, V>, Error> {
         let mut db = try!(self.alloc_page());
@@ -1238,7 +1237,7 @@ pub trait Transaction: skiplist::SkipList {
     }
 
     /// Gets the specified root. At most 508 different roots are allowed.
-    fn root<K: Representable, V: Representable>(&mut self, root: usize) -> Option<Db<K, V>> {
+    fn root<K: Representable, V: Representable>(&self, root: usize) -> Option<Db<K, V>> {
         debug!("root {:?}", root);
         let db = self.root_(1 + root);
         if db > 0 {
@@ -1291,11 +1290,11 @@ pub trait Transaction: skiplist::SkipList {
 }
 
 impl<'env> Transaction for Txn<'env> {}
-impl<'env, T> Transaction for MutTxn<'env, T> {}
+impl<'env> Transaction for MutTxn<'env> {}
 
 pub use transaction::Error;
 
-mod skiplist;
+pub mod skiplist;
 
 const PAGE_SIZE: u32 = 4096;
 const PAGE_SIZE_U16: u16 = 4096;

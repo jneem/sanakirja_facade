@@ -40,7 +40,7 @@ impl SkipCursor {
     }
 }
 
-impl<'env, T> MutTxn<'env, T> {
+impl<'env> MutTxn<'env> {
     #[doc(hidden)]
     pub fn skiplist_insert<R: Rng, K: Representable, V: Representable>
         (&mut self,
@@ -519,7 +519,7 @@ impl MutPage {
     }
 }
 
-impl<'env, T> SkipList for MutTxn<'env, T> {}
+impl<'env> SkipList for MutTxn<'env> {}
 impl<'env> SkipList for Txn<'env> {}
 
 impl SkipListPage for MutPage {}

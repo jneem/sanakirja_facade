@@ -5,6 +5,7 @@ authors = ["Joe Neeman <joeneeman@gmail.com>"]
 
 [dependencies]
 byteorder = "1.0"
+either = "1.1"
 rand = "0.3"
 sanakirja = { path = "sanakirja" }
 

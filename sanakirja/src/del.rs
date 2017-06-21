@@ -116,7 +116,7 @@ struct Replacement<K, V> {
     deleted_len: u16,
 }
 
-impl<'env, T> MutTxn<'env, T> {
+impl<'env> MutTxn<'env> {
     /// Find the smallest right descendant of the element at the given cursor.
     fn find_smallest_descendant<K, V>(&mut self, del: &mut Delete<K, V>) {
         // We need to look for the smallest element in the right
