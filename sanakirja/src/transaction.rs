@@ -83,6 +83,26 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
     }
 }
 
+pub enum MemSource {
+    File {
+        file: File,
+        lock_file: File,
+        mmap: memmap::Mmap,
+    },
+    Mem {
+        vec: Vec<u8>,
+    },
+}
+
+impl Drop for MemSource {
+    fn drop(&mut self) {
+        if let MemSource::File { ref lock_file, .. } = *self {
+            // TODO: what does it mean if the unlock fails? We shouldn't panic in a destructor...
+            let _ = lock_file.unlock();
+        }
+    }
+}
+
 // Lock order: first take thread locks, then process locks.
 
 // Why are there two synchronization mechanisms?
@@ -96,11 +116,12 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 /// cross-platform.
 pub struct Env {
     length: u64,
-    backing_file: File,
+    mem_source: MemSource,
+    //backing_file: File,
 
     /// It is undefined behavior to have a file mmapped for than once.
-    lock_file: File,
-    mmap: Option<memmap::Mmap>,
+    //lock_file: File,
+    //mmap: Option<memmap::Mmap>,
     map: *mut u8,
     first_unused_page: Mutex<u64>,
     /// Ensure all reads are done when sync starts.
@@ -114,12 +135,14 @@ unsafe impl Sync for Env {}
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let f = self.first_unused_page.lock().unwrap();
-        drop(self.mmap.take());
-        if *f > 0 {
-            self.backing_file.set_len(*f).unwrap();
+        // Try to truncate the backing file if we can.
+        if let MemSource::File { ref file, .. } = self.mem_source {
+            if let Ok(f) = self.first_unused_page.lock() {
+                if *f > 0 {
+                    let _ = file.set_len(*f);
+                }
+            }
         }
-        self.lock_file.unlock().unwrap();
     }
 }
 
@@ -204,6 +227,20 @@ impl Env {
         self.length
     }
 
+    /// Returns a new environment backed by memory.
+    pub fn new_memory_backed(length: u64) -> Result<Env, Error> {
+        let mut vec = vec![0; length as usize];
+        let map = vec.as_mut_ptr();
+        Ok(Env {
+            mem_source: MemSource::Mem { vec: vec },
+            length: length,
+            map: map,
+            first_unused_page: Mutex::new(0),
+            lock: RwLock::new(()),
+            mutable: Mutex::new(()),
+        })
+    }
+
     /// Initialize an environment. `length` must be a strictly
     /// positive multiple of 4096. The same file can only be open in
     /// one process or thread at the same time, and this is enforced
@@ -251,17 +288,20 @@ impl Env {
         }
         debug!("metadata.len() = {:?}", std::fs::metadata(&db_path).map(|x| x.len()));
         let env = Env {
+            mem_source: MemSource::File {
+                mmap: mmap,
+                file: file,
+                lock_file: lock_file,
+            },
             length: length,
-            mmap: Some(mmap),
             map: map,
-            backing_file: file,
-            lock_file: lock_file,
             first_unused_page: Mutex::new(0),
             lock: RwLock::new(()),
             mutable: Mutex::new(()),
         };
         Ok(env)
     }
+
     /// Start a read-only transaction.
     pub fn txn_begin<'env>(&'env self) -> Result<Txn<'env>, Error> {
         let read = try!(self.lock.read());
@@ -721,8 +761,10 @@ impl<'env> Commit for MutTxn<'env> {
             {
                 debug!("commit: taking local lock");
                 *self.env.lock.write().unwrap();
-                debug!("commit: taking file lock");
-                self.env.lock_file.lock_exclusive().unwrap();
+                if let MemSource::File { ref lock_file, .. } = self.env.mem_source {
+                    debug!("commit: taking file lock");
+                    lock_file.lock_exclusive().unwrap();
+                }
                 debug!("commit: lock ok");
                 for (u, v) in self.roots.iter() {
                     *((self.env.map.offset(ZERO_HEADER) as *mut u64).offset(*u as isize)) =
@@ -732,16 +774,21 @@ impl<'env> Commit for MutTxn<'env> {
                 // an actual page size, we flush the first two pages
                 // last, instead of just the last one.
                 debug!("env.length = {:?}", self.env.length);
-                if let Some(ref mmap) = self.env.mmap {
+                if let MemSource::File { ref mmap, .. } = self.env.mem_source {
                     mmap.flush_range(2 * PAGE_SIZE, (self.env.length - 2 * PAGE_SIZE_64) as usize)?;
-                    *((self.env.map as *mut u64).offset(OFF_MAP_LENGTH)) = self.last_page.to_le();
-                    *((self.env.map as *mut u64).offset(OFF_CURRENT_FREE)) = current_page.offset
-                        .to_le();
-                    mmap.flush_range(0, 2 * PAGE_SIZE)?;
-
                 }
-                debug!("commit: releasing lock");
-                self.env.lock_file.unlock().unwrap();
+                *((self.env.map as *mut u64).offset(OFF_MAP_LENGTH))
+                    = self.last_page.to_le();
+                *((self.env.map as *mut u64).offset(OFF_CURRENT_FREE))
+                    = current_page.offset.to_le();
+                if let MemSource::File { ref mmap, .. } = self.env.mem_source {
+                    mmap.flush_range(0, 2 * PAGE_SIZE)?;
+                }
+
+                if let MemSource::File { ref lock_file, .. } = self.env.mem_source {
+                    debug!("commit: releasing lock");
+                    lock_file.unlock().unwrap();
+                }
                 {
                     let mut last = self.env.first_unused_page.lock().unwrap();
                     debug!("last_page = {:?}", self.last_page);
