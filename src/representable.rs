@@ -1,5 +1,4 @@
 use byteorder::{ByteOrder, LittleEndian};
-use either::Either;
 use rand::Rng;
 use sanakirja;
 use std;
@@ -8,7 +7,7 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 
 use PAGE_SIZE;
-use {Alignment, MutTxn, Result, Storage};
+use {Alignment, WriteTxn, Result, Storage};
 
 pub trait ReprHeader: Copy {
     type PageOffsets: Iterator<Item=u64>;
@@ -16,6 +15,41 @@ pub trait ReprHeader: Copy {
     fn page_offsets(&self) -> Self::PageOffsets;
 }
 
+// Here is how representing things should work:
+//
+// There is a trait representing things that are stored in a database. This includes things like
+// page_offsets and drop_value. Call this trait Stored, for now.
+//
+// A database is parametrized over the types that are stored in it. That is, it's a
+// Db<K: Stored, V: Stored>.
+//
+// In order to look up something in a Db<K, V>, you just need a type that's Ord<K>.
+//
+// There's another trait representing things that can be written to a database. Call it
+// Storable<T: Stored> for now, where S: Storable<T: Stored> means that S can be written to a
+// database that stores things of type T.
+
+pub trait Stored<'sto>: Storable<Self> + Sized {
+    type Header: ReprHeader;
+
+    fn header(&self) -> Self::Header;
+    fn read_header(buf: &[u8]) -> Self::Header;
+    fn read_value(buf: &[u8], s: &Storage<'sto>) -> Self;
+    fn drop_value(&self, txn: &mut WriteTxn) -> Result<()>;
+}
+
+pub trait Storable<T>: PartialOrd<T> {
+    /// Writes `self` to `buf` in a format compatible with `T`.
+    fn write_value(&self, buf: &mut [u8]);
+
+    /// How large of a buffer does `write_value` need?
+    fn onpage_size(&self) -> u16;
+
+    /// How should `write_value`'s buffer be aligned?
+    fn alignment() -> Alignment;
+}
+
+/*
 /// This trait is for things that can be written to databases. They should be fairly small, or else
 /// it will be costly to read and write them. However, this trait has a trick up its sleeve for
 /// dealing with large buffers: you can implement this trait for a "reference" to a large buffer
@@ -44,7 +78,7 @@ pub trait Representable<'sto>: Ord + Searchable<Self> {
     fn read_header(buf: &[u8]) -> Self::Header;
 
     /// Frees all the pages owned by this value.
-    fn drop_value(&self, txn: &mut MutTxn) -> Result<()>;
+    fn drop_value(&self, txn: &mut WriteTxn) -> Result<()>;
 
     /// How much space do we need to write this object to a database?
     fn onpage_size(&self) -> u16 {
@@ -52,20 +86,40 @@ pub trait Representable<'sto>: Ord + Searchable<Self> {
     }
 }
 
-/// If `S: Searchable<K>` then `S` can be used to search in a database for something of type `K`.
+/// When the type `S` implements `Writable<T>`, it means that we can write `S` into a database that
+/// expects to store `T`. This is useful if converting `S` to `T` is expensive, but writing `S` to
+/// a database in `T`'s format has the same cost as writing `T`.
 ///
-/// This is a hack, to work around the fact that we need to wrap `Representable`s to get them in
-/// and out of sanakirja; we'd really like to be able to just require `S: Ord<K>`.
-pub trait Searchable<K: ?Sized> {
-    /// Returns either a `&K` or a pointer into the database where something of type `K` is stored.
-    fn storage_pointer(&self) -> Either<*const u8, &K>;
-}
+/// Here's a trivial example it `Writable` in action:
+///
+/// ```
+/// impl Writable<u64> for u32 {
+///     fn write_value(&self, buf: &mut [u8]) {
+///         LittleEndian::write_u64(buf, *self as u64);
+///     }
+///     fn onpage_size(&self) -> u16 { 8 }
+/// }
+/// ```
+///
+/// With the impl above, we would be able to insert `u32`s into a database that expects `u64`s. Of
+/// course this isn't particularly useful, because we could also just cast before inserting. But
+/// this would be useful in cases where conversion before insertion is expensive.
+///
+/// # Warning
+///
+/// When implementing `Writable<T>`, you need to be very careful that the format you write is
+/// identical to the format that `T` expects. Otherwise, you'll probably get database corruption.
+pub trait Writable<T>: Ord<T> {
+    /// Writes `self` to `buf` in a format compatible with `T`.
+    fn write_value(&self, buf: &mut [u8]);
 
-impl<K> Searchable<K> for K {
-    fn storage_pointer(&self) -> Either<*const u8, &K> {
-        Either::Right(self)
-    }
+    /// How large of a buffer does `write_value` need?
+    fn onpage_size(&self) -> u16;
+
+    /// How should `write_value`'s buffer be aligned?
+    fn alignment() -> Alignment;
 }
+*/
 
 #[derive(Clone, Copy, Debug)]
 pub struct U64ReprHeader {}
@@ -76,24 +130,26 @@ impl ReprHeader for U64ReprHeader {
     fn page_offsets(&self) -> Self::PageOffsets { std::iter::empty() }
 }
 
-impl<'sto> Representable<'sto> for u64 {
-    type Borrowed = u64;
-    type Header = U64ReprHeader;
-    fn header(&self) -> U64ReprHeader { U64ReprHeader {} }
-    fn read_header(_: &[u8]) -> U64ReprHeader { U64ReprHeader {} }
+impl Storable<u64> for u64 {
     fn alignment() -> Alignment { Alignment::B8 }
-    fn drop_value(&self, _: &mut MutTxn) -> Result<()> { Ok(()) }
+    fn onpage_size(&self) -> u16 { 8 }
 
     fn write_value(&self, buf: &mut [u8]) {
         LittleEndian::write_u64(buf, *self)
     }
+}
 
+impl<'sto> Stored<'sto> for u64 {
+    type Header = U64ReprHeader;
+    fn header(&self) -> U64ReprHeader { U64ReprHeader {} }
+    fn read_header(_: &[u8]) -> U64ReprHeader { U64ReprHeader {} }
+    fn drop_value(&self, _: &mut WriteTxn) -> Result<()> { Ok(()) }
     fn read_value(buf: &[u8], _: &Storage<'sto>) -> u64 {
         LittleEndian::read_u64(buf)
     }
 }
 
-pub(crate) enum Wrapper<'sto, T> where T: Representable<'sto> {
+pub(crate) enum Wrapper<'sto, S: Stored<'sto>, T> {
     // sanakirja::Representable requires Copy, but our Representable doesn't. So we can't store a
     // full T here, but only a pointer. This means we need to be careful not to use the pointer
     // for too long.
@@ -108,32 +164,29 @@ pub(crate) enum Wrapper<'sto, T> where T: Representable<'sto> {
     },
     OnPage {
         ptr: *const u8,
-        marker: PhantomData<&'sto Storage<'sto>>,
+        marker: PhantomData<(S, &'sto ())>,
     },
 }
 
-impl<'sto, T: Representable<'sto>> Wrapper<'sto, T> {
-    pub unsafe fn on_page_to_borrowed(&self, storage: &Storage<'sto>) -> T::Borrowed {
+impl<'sto, S: Stored<'sto>, T> Wrapper<'sto, S, T> {
+    pub unsafe fn to_stored(&self, storage: &Storage<'sto>) -> S {
         let ptr = match *self {
             Wrapper::OffPage { .. } => {
-                panic!("tried to borrow something that was already off the page")
+                panic!("tried to convert something that was off the page")
             }
             Wrapper::OnPage { ptr, .. } => ptr,
         };
-        let size = T::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size();
+        let size = S::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size();
         let slice = mk_slice(ptr, size as usize);
-        T::read_value(slice, storage)
+        S::read_value(slice, storage)
     }
 
-    pub fn new<Q: Searchable<T>>(val: &Q) -> Wrapper<'sto, T> {
-        match val.storage_pointer() {
-            Either::Right(p) => Wrapper::OffPage { ptr: p as *const T },
-            Either::Left(ptr) => Wrapper::OnPage { ptr, marker: std::marker::PhantomData },
-        }
+    pub fn wrap(val: &T) -> Wrapper<'sto, S, T> {
+        Wrapper::OffPage { ptr: val as *const T }
     }
 }
 
-impl<'sto, T: Representable<'sto>> Debug for Wrapper<'sto, T> {
+impl<'sto, S: Stored<'sto>, T> Debug for Wrapper<'sto, S, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
             Wrapper::OffPage { ptr } => f.write_fmt(format_args!("OffPage({:?})", ptr)),
@@ -142,9 +195,9 @@ impl<'sto, T: Representable<'sto>> Debug for Wrapper<'sto, T> {
     }
 }
 
-impl<'sto, T: Representable<'sto>> Copy for Wrapper<'sto, T> { }
+impl<'sto, S: Stored<'sto>, T> Copy for Wrapper<'sto, S, T> { }
 
-impl<'sto, T: Representable<'sto>> Clone for Wrapper<'sto, T> {
+impl<'sto, S: Stored<'sto>, T> Clone for Wrapper<'sto, S, T> {
     fn clone(&self) -> Self { *self }
 }
 
@@ -166,34 +219,35 @@ unsafe fn mk_mut_slice<'a>(p: *mut u8, mut len: usize) -> &'a mut [u8] {
     std::slice::from_raw_parts_mut(p, len)
 }
 
-unsafe fn read_value<'sto, V, L>(ptr: *const u8, loader: &L) -> V::Borrowed
+unsafe fn read_stored<'sto, S, L>(ptr: *const u8, loader: &L) -> S
 where
-V: Representable<'sto>,
-L: sanakirja::LoadPage
+S: Stored<'sto>,
+L: sanakirja::LoadPage,
 {
-    let size = V::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size();
+    let size = S::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size();
     let slice = mk_slice(ptr, size as usize);
 
     // Find the storage buffer underlying `loader` and make a `Storage` struct out of it.
     let base = loader.load_page(0).data;
     // The cast is ok: when we open the transaction we ensure that its length fits in a usize.
     let storage = Storage { base, len: loader.len() as usize, marker: PhantomData };
-    V::read_value(slice, &storage)
+    S::read_value(slice, &storage)
  }
 
-impl<'sto, T> sanakirja::Representable for Wrapper<'sto, T>
+impl<'sto, S, T> sanakirja::Representable for Wrapper<'sto, S, T>
 where
-T: Representable<'sto>
+S: Stored<'sto>,
+T: Storable<S>,
 {
-    type PageOffsets = <<T as Representable<'sto>>::Header as ReprHeader>::PageOffsets;
+    type PageOffsets = <<S as Stored<'sto>>::Header as ReprHeader>::PageOffsets;
     fn page_offsets(&self) -> Self::PageOffsets {
         match *self {
-            Wrapper::OffPage { ptr } => {
-                unsafe { (*ptr).header().page_offsets() }
+            Wrapper::OffPage { .. } => {
+                panic!("asked for page offsets of something off-page");
             }
             Wrapper::OnPage { ptr, .. } => {
                 unsafe {
-                    T::read_header(mk_slice(ptr, PAGE_SIZE)).page_offsets()
+                    S::read_header(mk_slice(ptr, PAGE_SIZE)).page_offsets()
                 }
             }
         }
@@ -203,7 +257,7 @@ T: Representable<'sto>
         match *self {
             Wrapper::OffPage { ptr } => unsafe { (*ptr).onpage_size() },
             Wrapper::OnPage { ptr, .. } => unsafe {
-                T::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size()
+                S::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size()
             }
         }
     }
@@ -229,32 +283,33 @@ T: Representable<'sto>
 
     unsafe fn cmp_value<Tn: sanakirja::LoadPage>(&self, txn: &Tn, x: Self) -> Ordering {
         use self::Wrapper::*;
-        let read = |ptr: *const u8| read_value::<T, Tn>(ptr, txn);
+        let read = |ptr: *const u8| read_stored::<S, Tn>(ptr, txn);
         match (*self, x) {
-            (OffPage { ptr: p }, OffPage { ptr: q }) => (*p).cmp(&*q),
-            (OnPage { ptr: p, .. }, OffPage { ptr: q }) => read(p).partial_cmp(&*q).unwrap(),
-            (OffPage { ptr: p }, OnPage { ptr: q, .. }) => read(q).partial_cmp(&*p).unwrap(),
-            (OnPage { ptr: p, .. }, OnPage { ptr: q, .. }) => read(p).cmp(&read(q)),
+            (OffPage { .. }, OffPage { .. }) => panic!("trying to compare two off-page values"),
+            (OnPage { ptr: p, .. }, OffPage { ptr: q }) => (*q).partial_cmp(&read(p)).unwrap(),
+            (OffPage { ptr: p }, OnPage { ptr: q, .. }) => (*p).partial_cmp(&read(q)).unwrap(),
+            (OnPage { ptr: p, .. }, OnPage { ptr: q, .. }) => read(p).partial_cmp(&read(q)).unwrap(),
         }
     }
 
     fn alignment() -> sanakirja::Alignment {
-        <T as Representable>::alignment()
+        <T as Storable<S>>::alignment()
     }
 
     unsafe fn skip(p: *mut u8) -> *mut u8 {
-        let size = T::read_header(mk_slice(p, PAGE_SIZE)).onpage_size();
+        let size = S::read_header(mk_slice(p, PAGE_SIZE)).onpage_size();
         p.offset(size as isize)
     }
 
     fn drop_value<R: Rng>(&self, txn: &mut sanakirja::MutTxn, _: &mut R) -> Result<()> {
         unsafe {
             // Since MutTxn is just a wrapper around sanakirja::MutTxn, we can convert the pointer.
-            let my_txn = std::mem::transmute::<&mut sanakirja::MutTxn, &mut MutTxn>(txn);
+            // FIXME: oops, this isn't true any more...
+            let my_txn = std::mem::transmute::<&mut sanakirja::MutTxn, &mut WriteTxn>(txn);
             match *self {
-                Wrapper::OffPage { ptr } => (*ptr).drop_value(my_txn),
+                Wrapper::OffPage { .. } => { Ok(()) },
                 Wrapper::OnPage { ptr: p, .. } => {
-                    let val = read_value::<T, _>(p, txn);
+                    let val = read_stored::<S, _>(p, txn);
                     val.drop_value(my_txn)
                 },
             }

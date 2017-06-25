@@ -1157,10 +1157,10 @@ pub trait Transaction: skiplist::SkipList {
     /// than or equal to `(key, value)` (and at the smallest key, or
     /// smallest value if one or both of them is `None`).
     fn iter<'a, K: Representable, V: Representable>(&'a self,
-                                                    db: &'a Db<K, V>,
+                                                    db: Db<K, V>,
                                                     key: Option<(K, Option<V>)>)
                                                     -> Cursor<'a, Self, K, V> {
-        let (stack, _) = self.set_cursors(db, key);
+        let (stack, _) = self.set_cursors(&db, key);
         let mut c = Cursor {
             txn: self,
             stack: stack,
@@ -1188,10 +1188,10 @@ pub trait Transaction: skiplist::SkipList {
 
     /// Iterate over a database in the reverse order, starting from the last binding strictly before `k` (or from the last binding in the table if `k.is_none()`).
     fn rev_iter<'a, K: Representable, V: Representable>(&'a self,
-                                                        db: &'a Db<K, V>,
+                                                        db: Db<K, V>,
                                                         key: Option<(K, Option<V>)>)
                                                         -> RevCursor<'a, Self, K, V> {
-        let (stack, _) = self.set_cursors(db, key);
+        let (stack, _) = self.set_cursors(&db, key);
         let mut c = RevCursor {
             txn: self,
             stack: stack,

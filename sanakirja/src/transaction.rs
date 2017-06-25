@@ -178,7 +178,7 @@ pub struct MutTxn<'env> {
     occupied_clean_pages: HashSet<u64>,
 
     /// Offsets of pages that were allocated by this transaction, and
-    /// then freed. */
+    /// then freed.
     free_clean_pages: Vec<u64>,
 
     /// Offsets of old pages freed by this transaction. These were
@@ -567,6 +567,10 @@ impl<'env> MutTxn<'env> {
             // Else, register it for freeing (we cannot reuse it in this transaction).
             self.free_pages.push(offset)
         }
+    }
+
+    pub fn base(&self) -> *mut u8 {
+        self.env.map
     }
 
     /// Pop a free page from the list of free pages.
