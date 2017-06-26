@@ -4,25 +4,35 @@ use sanakirja;
 use sanakirja::{Representable as SkRepr, Transaction};
 use std;
 
-use {Alignment, ReprHeader, Result, Storable, Storage, Stored, Wrapper, WriteTxn};
+use {Alignment, Alloc, StoredHeader, Result, Storable, Storage, Stored, Wrapper, WriteTxn};
 
 fn cast<'sto, K, V, J1, J2, U1, U2>(db: sanakirja::Db<Wrapper<'sto, K, J1>, Wrapper<'sto, V, U1>>)
 -> sanakirja::Db<Wrapper<'sto, K, J2>, Wrapper<'sto, V, U2>>
 where
 K: Stored<'sto>,
 V: Stored<'sto>,
-J1: Storable<K>,
-J2: Storable<K>,
-U1: Storable<V>,
-U2: Storable<V>,
+J1: Storable<'sto, K>,
+J2: Storable<'sto, K>,
+U1: Storable<'sto, V>,
+U2: Storable<'sto, V>,
 {
     unsafe { std::mem::transmute(db) }
 }
 
-#[derive(Clone, Copy)]
 pub struct Db<'sto, K: Stored<'sto>, V: Stored<'sto>> {
     pub(crate) sk_db: sanakirja::Db<Wrapper<'sto, K, K>, Wrapper<'sto, V, V>>,
     pub(crate) storage: Storage<'sto>,
+}
+
+impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Copy for Db<'sto, K, V> { }
+impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Clone for Db<'sto, K, V> {
+    fn clone(&self) -> Self { *self }
+}
+
+impl<'sto, K: Stored<'sto>, V: Stored<'sto>> std::fmt::Debug for Db<'sto, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Db({:?})", self.sk_db.0)
+    }
 }
 
 impl<'sto, K: Stored<'sto>, V: Stored<'sto>> PartialEq for Db<'sto, K, V> {
@@ -46,7 +56,7 @@ impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Ord for Db<'sto, K, V> {
     }
 }
 
-struct Iter<'a, 'sto: 'a, K: Stored<'sto>, V: Stored<'sto>, J: Storable<K>, U: Storable<V>> {
+struct Iter<'a, 'sto: 'a, K: Stored<'sto>, V: Stored<'sto>, J: Storable<'sto, K>, U: Storable<'sto, V>> {
     cursor: sanakirja::Cursor<'a, Storage<'sto>, Wrapper<'sto, K, J>, Wrapper<'sto, V, U>>,
     storage: Storage<'sto>,
 }
@@ -62,12 +72,12 @@ impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
 
     /// Returns an iterator over key/value pairs, starting with the first one whose key is at least
     /// `key`.
-    pub fn iter_from_key<'a, Q: Storable<K> + 'a>(&'a self, key: &Q)
+    pub fn iter_from_key<'a, Q: Storable<'sto, K> + 'a>(&'a self, key: &Q)
     -> impl Iterator<Item=(K, V)> + 'a
     {
         let db = cast::<K, V, K, Q, V, V>(self.sk_db);
         Iter {
-            cursor: self.storage.iter(db, Some((Wrapper::wrap(key), None))),
+            cursor: self.storage.iter(db, Some((Wrapper::search(key), None))),
             storage: self.storage,
         }
     }
@@ -77,19 +87,19 @@ impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
     pub fn iter_from_key_value<'a, Q: 'a, R: 'a>(&'a self, key: &Q, val: &R)
     -> impl Iterator<Item=(K, V)> + 'a
     where
-    Q: Storable<K>,
-    R: Storable<V>,
+    Q: Storable<'sto, K>,
+    R: Storable<'sto, V>,
     {
         let db = cast(self.sk_db);
         Iter {
-            cursor: self.storage.iter(db, Some((Wrapper::wrap(key), Some(Wrapper::wrap(val))))),
+            cursor: self.storage.iter(db, Some((Wrapper::search(key), Some(Wrapper::search(val))))),
             storage: self.storage,
         }
     }
 
     /// Gets the smallest value associated with `key`, if there is one.
     pub fn get<Q>(&self, key: &Q) -> Option<V>
-    where Q: Storable<K> + PartialEq<K>
+    where Q: Storable<'sto, K> + PartialEq<K>
     {
         if let Some((k, v)) = self.iter_from_key(key).next() {
             if key.eq(&k) {
@@ -113,7 +123,7 @@ impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
     }
 }
 
-impl<'a, 'sto, K: Stored<'sto>, V: Stored<'sto>, J: Storable<K>, U: Storable<V>> Iterator for Iter<'a, 'sto, K, V, J, U> {
+impl<'a, 'sto, K: Stored<'sto>, V: Stored<'sto>, J: Storable<'sto, K>, U: Storable<'sto, V>> Iterator for Iter<'a, 'sto, K, V, J, U> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -131,7 +141,7 @@ pub struct DbHeader {
     page_offset: u64,
 }
 
-impl ReprHeader for DbHeader {
+impl StoredHeader for DbHeader {
     type PageOffsets = std::iter::Once<u64>;
     fn onpage_size(&self) -> u16 { 8 }
     fn page_offsets(&self) -> Self::PageOffsets {
@@ -139,15 +149,8 @@ impl ReprHeader for DbHeader {
     }
 }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Storable<Db<'sto, K, V>> for Db<'sto, K, V> {
-    fn alignment() -> Alignment { Alignment::B8 }
-    fn onpage_size(&self) -> u16 { 8 }
-    fn write_value(&self, buf: &mut [u8]) {
-        LittleEndian::write_u64(buf, self.sk_db.0);
-    }
-}
-
 impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Stored<'sto> for Db<'sto, K, V> {
+    fn alignment() -> Alignment { Alignment::B8 }
     type Header = DbHeader;
 
     fn header(&self) -> DbHeader {
@@ -161,19 +164,35 @@ impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Stored<'sto> for Db<'sto, K, V> {
         }
     }
 
+    fn write_value(&self, buf: &mut [u8]) {
+        LittleEndian::write_u64(buf, self.sk_db.0);
+    }
+
     fn read_header(buf: &[u8]) -> DbHeader {
         DbHeader { page_offset: LittleEndian::read_u64(buf) }
     }
 
-    fn drop_value(&self, txn: &mut WriteTxn) -> Result<()> {
-        self.sk_db.drop_value(&mut *txn.sk_txn.borrow_mut(), &mut rand::thread_rng())
+    fn drop_value(&self, alloc: &mut Alloc) -> Result<()> {
+        alloc.txn.with_mut_txn(|t|
+            self.sk_db.drop_value(t, &mut rand::thread_rng())
+        )
     }
+}
+
+impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Storable<'sto, Db<'sto, K, V>> for Db<'sto, K, V> {
+    fn store(&self, _: &mut Alloc) -> Result<Self> { Ok(*self) }
 }
 
 #[derive(Clone, Copy)]
 pub struct WriteDb<'txn, 'sto: 'txn, K: Stored<'sto>, V: Stored<'sto>> {
     pub(crate) sk_db: sanakirja::Db<Wrapper<'sto, K, K>, Wrapper<'sto, V, V>>,
     pub(crate) txn: &'txn WriteTxn<'sto>,
+}
+
+impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> std::fmt::Debug for WriteDb<'txn, 'sto, K, V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "WriteDb({:?})", self.sk_db.0)
+    }
 }
 
 impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> PartialEq for WriteDb<'txn, 'sto, K, V> {
@@ -210,11 +229,12 @@ impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> Ord for WriteDb<'txn, 'sto, K
     }
 }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> Storable<Db<'sto, K, V>> for WriteDb<'txn, 'sto, K, V> {
-    fn alignment() -> Alignment { Alignment::B8 }
-    fn onpage_size(&self) -> u16 { 8 }
-    fn write_value(&self, buf: &mut [u8]) {
-        LittleEndian::write_u64(buf, self.sk_db.0);
+impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> Storable<'sto, Db<'sto, K, V>> for WriteDb<'txn, 'sto, K, V> {
+    fn store(&self, _: &mut Alloc) -> Result<Db<'sto, K, V>> {
+        Ok(Db {
+            sk_db: self.sk_db,
+            storage: self.txn.storage(),
+        })
     }
 }
 
@@ -222,25 +242,31 @@ impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> Storable<Db<'sto, K, V>> for 
 // into a readable Db, because the storage underlying a WriteDb is prone to invalidation.
 impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> WriteDb<'txn, 'sto, K, V> {
     // TODO: return an enum to indicate whether the binding existed already
-    pub fn insert<J: Storable<K>, U: Storable<V>>(&mut self, key: J, val: U) -> Result<()> {
-        let mut db = cast(self.sk_db);
-        self.txn.sk_txn.borrow_mut()
-            .put(&mut rand::thread_rng(), &mut db, Wrapper::wrap(&key), Wrapper::wrap(&val))?;
+    pub fn insert<J: Storable<'sto, K>, U: Storable<'sto, V>>(&mut self, key: J, val: U) -> Result<()> {
+        let key: K = key.store(&mut self.txn.allocator())?;
+        let val: V = val.store(&mut self.txn.allocator())?;
+        self.txn.with_mut_txn(|txn|
+            txn.put(&mut rand::thread_rng(), &mut self.sk_db, Wrapper::wrap(&key), Wrapper::wrap(&val))
+        )?;
         Ok(())
     }
 
-    pub fn remove_first<J: Storable<K>>(&mut self, key: &J) -> Result<()> {
+    pub fn remove_first<J: Storable<'sto, K>>(&mut self, key: &J) -> Result<()> {
         let mut db = cast::<K, V, K, J, V, V>(self.sk_db);
-        self.txn.sk_txn.borrow_mut()
-            .del(&mut rand::thread_rng(), &mut db, Wrapper::wrap(key), None)?;
+        self.txn.with_mut_txn(|txn|
+            txn.del(&mut rand::thread_rng(), &mut db, Wrapper::search(key), None)
+        )?;
+        self.sk_db = cast(db);
         Ok(())
     }
 
-    pub fn remove_pair<J: Storable<K>, U: Storable<V>>(&mut self, key: &K, val: &V)
+    pub fn remove_pair<J: Storable<'sto, K>, U: Storable<'sto, V>>(&mut self, key: &K, val: &V)
     -> Result<()> {
         let mut db = cast(self.sk_db);
-        self.txn.sk_txn.borrow_mut()
-            .del(&mut rand::thread_rng(), &mut db, Wrapper::wrap(key), Some(Wrapper::wrap(val)))?;
+        self.txn.with_mut_txn(|txn|
+            txn.del(&mut rand::thread_rng(), &mut db, Wrapper::search(key), Some(Wrapper::search(val)))
+        )?;
+        self.sk_db = cast(db);
         Ok(())
     }
 }

@@ -50,7 +50,7 @@ use skiplist::SkipCursor;
 use rand::Rng;
 /// A database is a skip list of (page offset, key, value).
 #[derive(Clone, Copy, Debug)]
-pub struct Db<K: Representable, V: Representable>(pub u64, std::marker::PhantomData<(K, V)>);
+pub struct Db<K: Representable, V: Representable>(pub u64, pub std::marker::PhantomData<(K, V)>);
 
 /// Values, which might be either inlined on the page, or stored as a reference if too large.
 pub mod value;

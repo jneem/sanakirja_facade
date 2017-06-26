@@ -231,7 +231,7 @@ impl<'env> MutTxn<'env> {
                 cursor.pointer -= 1;
             }
 
-            db.0 = cursor[1].page
+            db.0 = cursor[1].page;
 
         } else {
             // The root has split, no need to do anything.

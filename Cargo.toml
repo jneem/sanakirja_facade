@@ -9,3 +9,5 @@ either = "1.1"
 rand = "0.3"
 sanakirja = { path = "sanakirja" }
 
+[dev-dependencies]
+env_logger = "0.4.3"

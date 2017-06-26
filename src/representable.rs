@@ -7,12 +7,18 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 
 use PAGE_SIZE;
-use {Alignment, WriteTxn, Result, Storage};
+use {Alignment, Alloc, WriteTxn, Result, Storage};
 
-pub trait ReprHeader: Copy {
+/// Objects that are stored in the database often need to store some important metadata along with
+/// them. This trait represents that metadata.
+pub trait StoredHeader: Copy {
+    /// This has to do with garbage collection, and could probably do with a better name.
     type PageOffsets: Iterator<Item=u64>;
-    fn onpage_size(&self) -> u16;
+    /// This has to do with garbage collection, and could probably do with a better name.
     fn page_offsets(&self) -> Self::PageOffsets;
+
+    /// How much space does the object need in the database?
+    fn onpage_size(&self) -> u16;
 }
 
 // Here is how representing things should work:
@@ -29,130 +35,93 @@ pub trait ReprHeader: Copy {
 // Storable<T: Stored> for now, where S: Storable<T: Stored> means that S can be written to a
 // database that stores things of type T.
 
-pub trait Stored<'sto>: Storable<Self> + Sized {
-    type Header: ReprHeader;
+/// This is the trait for objects that are stored in a database. They should be fairly small, or
+/// else it will be costly to read and write them. However, since they can also store references
+/// into the database, you can implement `Stored` for a view into a large buffer.
+pub trait Stored<'sto>: Storable<'sto, Self> + Sized {
+    /// This is the metadata associated with this type.
+    type Header: StoredHeader;
 
+    /// Returns my metadata.
     fn header(&self) -> Self::Header;
-    fn read_header(buf: &[u8]) -> Self::Header;
-    fn read_value(buf: &[u8], s: &Storage<'sto>) -> Self;
-    fn drop_value(&self, txn: &mut WriteTxn) -> Result<()>;
-}
 
-pub trait Storable<T>: PartialOrd<T> {
-    /// Writes `self` to `buf` in a format compatible with `T`.
-    fn write_value(&self, buf: &mut [u8]);
-
-    /// How large of a buffer does `write_value` need?
-    fn onpage_size(&self) -> u16;
-
-    /// How should `write_value`'s buffer be aligned?
-    fn alignment() -> Alignment;
-}
-
-/*
-/// This trait is for things that can be written to databases. They should be fairly small, or else
-/// it will be costly to read and write them. However, this trait has a trick up its sleeve for
-/// dealing with large buffers: you can implement this trait for a "reference" to a large buffer
-/// that is actually stored in some backing storage. See `LargeBuf` for an example.
-pub trait Representable<'sto>: Ord + Searchable<Self> {
-    /// When reading from the database, sometimes we'd prefer just to return a reference instead of
-    /// copying the data. That's why the return type of `read_value` is `Self::Borrowed` instead of
-    /// `Self`. For small, plain-old-data types implementing `Representable`, `Self::Borrowed`
-    /// would probably just be equal to `Self` (but associated type defaults are unstable).
-    type Borrowed: Representable<'sto> + PartialOrd<Self> + Searchable<Self>;
-
-    type Header: ReprHeader;
-
-    fn header(&self) -> Self::Header;
-    fn alignment() -> Alignment;
-
-    /// Write this object to a buffer, which is guaranteed to have length `self.onpage_size()`.
-    fn write_value(&self, buf: &mut [u8]);
-
-    fn read_value(buf: &[u8], s: &Storage<'sto>) -> Self::Borrowed;
-
-    /// Reads the header from a buffer.
+    /// Reads a header from the database.
     ///
-    /// The length of the buffer is a little hard to predict: it starts from some unpredictable
-    /// location and continues until the end of the enclosing page.
+    /// The buffer `buf` is the same one that gets passed to `read_value`.
     fn read_header(buf: &[u8]) -> Self::Header;
 
-    /// Frees all the pages owned by this value.
-    fn drop_value(&self, txn: &mut WriteTxn) -> Result<()>;
+    /// Reads the entire object from the database.
+    fn read_value(buf: &[u8], s: &Storage<'sto>) -> Self;
 
-    /// How much space do we need to write this object to a database?
+    /// Deletes this object from the database.
+    ///
+    /// This function can be empty unless the object allocated its own pages. In case your object
+    /// does allocate its own pages, see the crate documentation for more information about memory
+    /// allocation and garbage collection in sanakirja.
+    fn drop_value<'a>(&self, alloc: &mut Alloc<'a, 'sto>) -> Result<()>;
+
+    /// How large of a buffer do `write_value` and `read_value` need?
     fn onpage_size(&self) -> u16 {
         self.header().onpage_size()
     }
-}
-
-/// When the type `S` implements `Writable<T>`, it means that we can write `S` into a database that
-/// expects to store `T`. This is useful if converting `S` to `T` is expensive, but writing `S` to
-/// a database in `T`'s format has the same cost as writing `T`.
-///
-/// Here's a trivial example it `Writable` in action:
-///
-/// ```
-/// impl Writable<u64> for u32 {
-///     fn write_value(&self, buf: &mut [u8]) {
-///         LittleEndian::write_u64(buf, *self as u64);
-///     }
-///     fn onpage_size(&self) -> u16 { 8 }
-/// }
-/// ```
-///
-/// With the impl above, we would be able to insert `u32`s into a database that expects `u64`s. Of
-/// course this isn't particularly useful, because we could also just cast before inserting. But
-/// this would be useful in cases where conversion before insertion is expensive.
-///
-/// # Warning
-///
-/// When implementing `Writable<T>`, you need to be very careful that the format you write is
-/// identical to the format that `T` expects. Otherwise, you'll probably get database corruption.
-pub trait Writable<T>: Ord<T> {
-    /// Writes `self` to `buf` in a format compatible with `T`.
-    fn write_value(&self, buf: &mut [u8]);
-
-    /// How large of a buffer does `write_value` need?
-    fn onpage_size(&self) -> u16;
 
     /// How should `write_value`'s buffer be aligned?
     fn alignment() -> Alignment;
+
+    /// Writes `self` to `buf`.
+    fn write_value(&self, buf: &mut [u8]);
 }
-*/
+
+/// When the type `S` implements `Storable<T>`, it means that we can write `S` into a database that
+/// expects to store `T`. For example, `LargeBuf` is a large buffer that's stored in the database,
+/// and `[u8]` implements `Writable<LargeBuf>`, since it's sometimes useful to take a buffer
+/// outside the database and write it to the database.
+///
+/// `Storable<T>` requires `PartialOrd<T>`, because if you want to write something into a database
+/// then you first need to find out where it goes (and our databases are stored as ordered maps).
+///
+/// `Stored` implies `Storable<Self>`, because if you read something from the database then you
+/// might want to write it back somewhere.
+///
+/// # Warning
+///
+/// When implementing `Storable<T>`, you need to be very careful that the format you write is
+/// identical to the format that `T` expects. Otherwise, you'll probably get database corruption.
+pub trait Storable<'sto, T>: PartialOrd<T> {
+    fn store<'a>(&self, alloc: &mut Alloc<'a, 'sto>) -> Result<T>;
+}
 
 #[derive(Clone, Copy, Debug)]
-pub struct U64ReprHeader {}
+pub struct U64StoredHeader {}
 
-impl ReprHeader for U64ReprHeader {
+impl StoredHeader for U64StoredHeader {
     type PageOffsets = std::iter::Empty<u64>;
     fn onpage_size(&self) -> u16 { 8 }
     fn page_offsets(&self) -> Self::PageOffsets { std::iter::empty() }
 }
 
-impl Storable<u64> for u64 {
-    fn alignment() -> Alignment { Alignment::B8 }
-    fn onpage_size(&self) -> u16 { 8 }
+impl<'sto> Storable<'sto, u64> for u64 {
+    fn store(&self, _: &mut Alloc) -> Result<u64> { Ok(*self) }
+}
 
+impl<'sto> Stored<'sto> for u64 {
+    type Header = U64StoredHeader;
+    fn header(&self) -> U64StoredHeader { U64StoredHeader {} }
+    fn read_header(_: &[u8]) -> U64StoredHeader { U64StoredHeader {} }
+    fn drop_value(&self, _: &mut Alloc) -> Result<()> { Ok(()) }
+    fn alignment() -> Alignment { Alignment::B8 }
+    fn read_value(buf: &[u8], _: &Storage<'sto>) -> u64 {
+        LittleEndian::read_u64(buf)
+    }
     fn write_value(&self, buf: &mut [u8]) {
         LittleEndian::write_u64(buf, *self)
     }
 }
 
-impl<'sto> Stored<'sto> for u64 {
-    type Header = U64ReprHeader;
-    fn header(&self) -> U64ReprHeader { U64ReprHeader {} }
-    fn read_header(_: &[u8]) -> U64ReprHeader { U64ReprHeader {} }
-    fn drop_value(&self, _: &mut WriteTxn) -> Result<()> { Ok(()) }
-    fn read_value(buf: &[u8], _: &Storage<'sto>) -> u64 {
-        LittleEndian::read_u64(buf)
-    }
-}
-
 pub(crate) enum Wrapper<'sto, S: Stored<'sto>, T> {
-    // sanakirja::Representable requires Copy, but our Representable doesn't. So we can't store a
-    // full T here, but only a pointer. This means we need to be careful not to use the pointer
-    // for too long.
+    // sanakirja::Representable requires Copy, but Stored and T don't. So we can't store S or T
+    // here, but only a pointer. This means we need to be careful not to use the pointer for too
+    // long.
     //
     // The point is that Wrapper::OffPage is not supposed to live long. Given a T, we create a
     // Wrapper::OffPage in order to write the T into a database; then we throw away the wrapper.
@@ -160,29 +129,39 @@ pub(crate) enum Wrapper<'sto, S: Stored<'sto>, T> {
     // the wrapper might last longer, but it will be a Wrapper::OnPage (which is guaranteed to be
     // valid for the lifetime of the storage).
     OffPage {
-        ptr: *const T,
+        ptr: *const S,
     },
     OnPage {
         ptr: *const u8,
         marker: PhantomData<(S, &'sto ())>,
     },
+    // This is a hack to allow searching for Stored types using something that can be compared to
+    // them.
+    Searcher {
+        ptr: *const T,
+    }
 }
 
 impl<'sto, S: Stored<'sto>, T> Wrapper<'sto, S, T> {
     pub unsafe fn to_stored(&self, storage: &Storage<'sto>) -> S {
-        let ptr = match *self {
-            Wrapper::OffPage { .. } => {
-                panic!("tried to convert something that was off the page")
-            }
-            Wrapper::OnPage { ptr, .. } => ptr,
-        };
-        let size = S::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size();
-        let slice = mk_slice(ptr, size as usize);
-        S::read_value(slice, storage)
+        match *self {
+            Wrapper::OnPage { ptr, .. } => {
+                let size = S::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size();
+                let slice = mk_slice(ptr, size as usize);
+                S::read_value(slice, storage)
+            },
+            _ => {
+                panic!("tried to convert something that wasn't on-page")
+            },
+        }
     }
 
-    pub fn wrap(val: &T) -> Wrapper<'sto, S, T> {
-        Wrapper::OffPage { ptr: val as *const T }
+    pub fn wrap(val: &S) -> Wrapper<'sto, S, T> {
+        Wrapper::OffPage { ptr: val as *const S }
+    }
+
+    pub fn search(val: &T) -> Wrapper<'sto, S, T> {
+        Wrapper::Searcher { ptr: val as *const T }
     }
 }
 
@@ -191,6 +170,7 @@ impl<'sto, S: Stored<'sto>, T> Debug for Wrapper<'sto, S, T> {
         match *self {
             Wrapper::OffPage { ptr } => f.write_fmt(format_args!("OffPage({:?})", ptr)),
             Wrapper::OnPage { ptr, .. } => f.write_fmt(format_args!("OnPage({:?})", ptr)),
+            Wrapper::Searcher { ptr } => f.write_fmt(format_args!("Searcher({:?})", ptr)),
         }
     }
 }
@@ -228,7 +208,7 @@ L: sanakirja::LoadPage,
     let slice = mk_slice(ptr, size as usize);
 
     // Find the storage buffer underlying `loader` and make a `Storage` struct out of it.
-    let base = loader.load_page(0).data;
+    let base = loader.load_page(0).data as *mut u8;
     // The cast is ok: when we open the transaction we ensure that its length fits in a usize.
     let storage = Storage { base, len: loader.len() as usize, marker: PhantomData };
     S::read_value(slice, &storage)
@@ -237,18 +217,19 @@ L: sanakirja::LoadPage,
 impl<'sto, S, T> sanakirja::Representable for Wrapper<'sto, S, T>
 where
 S: Stored<'sto>,
-T: Storable<S>,
+T: Storable<'sto, S>,
 {
-    type PageOffsets = <<S as Stored<'sto>>::Header as ReprHeader>::PageOffsets;
+    type PageOffsets = <<S as Stored<'sto>>::Header as StoredHeader>::PageOffsets;
     fn page_offsets(&self) -> Self::PageOffsets {
         match *self {
-            Wrapper::OffPage { .. } => {
-                panic!("asked for page offsets of something off-page");
-            }
+            Wrapper::OffPage { ptr } => unsafe { (*ptr).header().page_offsets() },
             Wrapper::OnPage { ptr, .. } => {
                 unsafe {
                     S::read_header(mk_slice(ptr, PAGE_SIZE)).page_offsets()
                 }
+            }
+            Wrapper::Searcher { .. } => {
+                panic!("asked for page offsets of a searcher");
             }
         }
     }
@@ -258,7 +239,10 @@ T: Storable<S>,
             Wrapper::OffPage { ptr } => unsafe { (*ptr).onpage_size() },
             Wrapper::OnPage { ptr, .. } => unsafe {
                 S::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size()
-            }
+            },
+            Wrapper::Searcher { .. } => {
+                panic!("tried to get on-page size of a searcher");
+            },
         }
     }
 
@@ -266,11 +250,14 @@ T: Storable<S>,
         match *self {
             Wrapper::OffPage { ptr } => {
                 (*ptr).write_value(mk_mut_slice(p, (*ptr).onpage_size() as usize));
-            }
+            },
             Wrapper::OnPage { ptr, .. } => {
                 // TODO: explain this
                 std::ptr::copy_nonoverlapping(ptr, p, self.onpage_size() as usize);
-            }
+            },
+            Wrapper::Searcher { .. } => {
+                panic!("tried to write a searcher");
+            },
         }
     }
 
@@ -285,15 +272,17 @@ T: Storable<S>,
         use self::Wrapper::*;
         let read = |ptr: *const u8| read_stored::<S, Tn>(ptr, txn);
         match (*self, x) {
-            (OffPage { .. }, OffPage { .. }) => panic!("trying to compare two off-page values"),
             (OnPage { ptr: p, .. }, OffPage { ptr: q }) => (*q).partial_cmp(&read(p)).unwrap(),
             (OffPage { ptr: p }, OnPage { ptr: q, .. }) => (*p).partial_cmp(&read(q)).unwrap(),
+            (OnPage { ptr: p, .. }, Searcher { ptr: q }) => (*q).partial_cmp(&read(p)).unwrap(),
+            (Searcher { ptr: p }, OnPage { ptr: q, .. }) => (*p).partial_cmp(&read(q)).unwrap(),
             (OnPage { ptr: p, .. }, OnPage { ptr: q, .. }) => read(p).partial_cmp(&read(q)).unwrap(),
+            _ => panic!("trying to compare two things that weren't on-page"),
         }
     }
 
     fn alignment() -> sanakirja::Alignment {
-        <T as Storable<S>>::alignment()
+        <S as Stored>::alignment()
     }
 
     unsafe fn skip(p: *mut u8) -> *mut u8 {
@@ -303,14 +292,17 @@ T: Storable<S>,
 
     fn drop_value<R: Rng>(&self, txn: &mut sanakirja::MutTxn, _: &mut R) -> Result<()> {
         unsafe {
-            // Since MutTxn is just a wrapper around sanakirja::MutTxn, we can convert the pointer.
-            // FIXME: oops, this isn't true any more...
-            let my_txn = std::mem::transmute::<&mut sanakirja::MutTxn, &mut WriteTxn>(txn);
             match *self {
-                Wrapper::OffPage { .. } => { Ok(()) },
                 Wrapper::OnPage { ptr: p, .. } => {
                     let val = read_stored::<S, _>(p, txn);
-                    val.drop_value(my_txn)
+                    // The sanakirja interface doesn't give us any control over the lifetime of the
+                    // storage, so we need to hack it in with a transmute.
+                    let txn: &mut sanakirja::MutTxn<'sto> = std::mem::transmute(txn);
+                    let my_txn = WriteTxn::from_mut_ref(txn);
+                    val.drop_value(&mut my_txn.allocator())
+                },
+                _ => {
+                    panic!("tried to drop something that wasn't stored");
                 },
             }
         }

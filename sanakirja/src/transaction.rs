@@ -37,6 +37,9 @@ pub enum Error {
 
     /// Lock poisoning error.
     Poison,
+
+    /// You tried to create a mutable transaction while another one was active.
+    MultipleWriters,
 }
 
 impl std::fmt::Display for Error {
@@ -48,6 +51,8 @@ impl std::fmt::Display for Error {
                        "Not enough space. Try opening the environment with a larger size.")
             }
             Error::Poison => write!(f, "Lock poisoning error"),
+            Error::MultipleWriters =>
+                write!(f, "You tried to create a multable transaction while another one was active"),
         }
     }
 }
@@ -60,6 +65,7 @@ impl std::error::Error for Error {
                 "Not enough space. Try opening the environment with a larger size."
             }
             Error::Poison => "Poison error",
+            Error::MultipleWriters => "Multiple writers",
         }
     }
     fn cause(&self) -> Option<&std::error::Error> {
@@ -67,7 +73,7 @@ impl std::error::Error for Error {
             Error::IO(ref err) => Some(err),
             Error::NotEnoughSpace => None,
             Error::Poison => None,
-
+            Error::MultipleWriters => None,
         }
     }
 }
@@ -80,6 +86,15 @@ impl From<std::io::Error> for Error {
 impl<T> From<std::sync::PoisonError<T>> for Error {
     fn from(_: std::sync::PoisonError<T>) -> Error {
         Error::Poison
+    }
+}
+
+impl<T> From<std::sync::TryLockError<T>> for Error {
+    fn from(e: std::sync::TryLockError<T>) -> Error {
+        match e {
+            std::sync::TryLockError::Poisoned(_) => Error::Poison,
+            std::sync::TryLockError::WouldBlock => Error::MultipleWriters,
+        }
     }
 }
 
@@ -157,7 +172,7 @@ pub struct Txn<'env> {
 pub struct MutTxn<'env> {
     env: &'env Env,
     mutable: Option<MutexGuard<'env, ()>>,
-    parent: Option<Box<MutTxn<'env>>>,
+    pub parent: Option<Box<MutTxn<'env>>>,
 
     /// The offset from the beginning of the file, of the first free
     /// page at the end of the file. Note that there might be other
@@ -185,7 +200,7 @@ pub struct MutTxn<'env> {
     /// *not* allocated by this transaction.
     free_pages: Vec<u64>,
 
-    roots: HashMap<usize, u64>,
+    pub roots: HashMap<usize, u64>,
 }
 
 impl<'env> Drop for Txn<'env> {
@@ -320,7 +335,7 @@ impl Env {
                 .offset(OFF_CURRENT_FREE)));
 
             debug!("map header = {:?}, {:?}", last_page, current_list_page);
-            let guard = try!(self.mutable.lock());
+            let guard = self.mutable.try_lock()?;
             debug!("lock ok");
             assert!(current_list_page < self.length);
             let current_list_page = Page {
@@ -507,8 +522,8 @@ impl Cow {
 
 impl<'env> MutTxn<'env> {
     /// Start a mutable transaction.
-    pub fn mut_txn_begin<'txn>(self)
-                               -> Result<MutTxn<'env>, Error> {
+    // Despite the signature, this can't actually fail.
+    pub fn mut_txn_begin<'txn>(self) -> Result<MutTxn<'env>, Error> {
         let mut txn = MutTxn {
             env: self.env,
             mutable: None,
@@ -663,35 +678,26 @@ pub trait Commit {
     fn commit(self) -> Result<(), Error>;
 }
 
-/*
-impl<'a, 'env, T> Commit for MutTxn<'env, &'a mut MutTxn<'env, T>> {
-    fn commit(mut self) -> Result<(), Error> {
-
-        self.parent.last_page = self.last_page;
-        self.parent.current_list_page = Page {
+impl<'env> MutTxn<'env> {
+    fn commit_to_parent(mut self) -> MutTxn<'env> {
+        let mut parent = self.parent.take().unwrap();
+        parent.last_page = self.last_page;
+        parent.current_list_page = Page {
             offset: self.current_list_page.offset,
             data: self.current_list_page.data,
         };
-        self.parent.current_list_length = self.current_list_length;
-        self.parent.current_list_position = self.current_list_position;
-        self.parent.occupied_clean_pages.extend(self.occupied_clean_pages.iter());
-        self.parent.free_clean_pages.extend(self.free_clean_pages.iter());
-        self.parent.free_pages.extend(self.free_pages.iter());
+        parent.current_list_length = self.current_list_length;
+        parent.current_list_position = self.current_list_position;
+        parent.occupied_clean_pages.extend(self.occupied_clean_pages.iter());
+        parent.free_clean_pages.extend(self.free_clean_pages.iter());
+        parent.free_pages.extend(self.free_pages.iter());
         for (u, v) in self.roots.iter() {
-            self.parent.roots.insert(*u, *v);
+            parent.roots.insert(*u, *v);
         }
-        Ok(())
+        *parent
     }
-}
-*/
 
-impl<'env> Commit for MutTxn<'env> {
-    /// Commit a transaction. This is guaranteed to be atomic: either
-    /// the commit succeeds, and all the changes made during the
-    /// transaction are written to disk. Or the commit doesn't
-    /// succeed, and we're back to the state just before starting the
-    /// transaction.
-    fn commit(mut self) -> Result<(), Error> {
+    fn commit_to_env(mut self) -> Result<(), Error> {
         // Tasks:
         //
         // - allocate new pages (copy-on-write) to write the new list
@@ -806,5 +812,20 @@ impl<'env> Commit for MutTxn<'env> {
                 Ok(())
             }
         }
+    }
+}
+
+impl<'env> Commit for MutTxn<'env> {
+    /// Commit a transaction. This is guaranteed to be atomic: either
+    /// the commit succeeds, and all the changes made during the
+    /// transaction are written to disk. Or the commit doesn't
+    /// succeed, and we're back to the state just before starting the
+    /// transaction.
+    fn commit(self) -> Result<(), Error> {
+        let mut txn = self;
+        while txn.parent.is_some() {
+            txn = txn.commit_to_parent();
+        }
+        txn.commit_to_env()
     }
 }
