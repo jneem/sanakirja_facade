@@ -1,0 +1,12 @@
+[package]
+name = "sanakirja_facade_derive"
+version = "0.1.0"
+authors = ["Joe Neeman <joeneeman@gmail.com>"]
+
+[dependencies]
+quote = "0.3"
+sanakirja_facade = { path = ".." }
+syn = "0.11"
+
+[lib]
+proc-macro = true

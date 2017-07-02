@@ -6,63 +6,64 @@ use std;
 
 use {Alignment, Alloc, StoredHeader, Result, Storable, Storage, Stored, Wrapper, WriteTxn};
 
-fn cast<'sto, K, V, J1, J2, U1, U2>(db: sanakirja::Db<Wrapper<'sto, K, J1>, Wrapper<'sto, V, U1>>)
--> sanakirja::Db<Wrapper<'sto, K, J2>, Wrapper<'sto, V, U2>>
+fn cast<'env, K, V, J1, J2, U1, U2>(db: sanakirja::Db<Wrapper<'env, K, J1>, Wrapper<'env, V, U1>>)
+-> sanakirja::Db<Wrapper<'env, K, J2>, Wrapper<'env, V, U2>>
 where
-K: Stored<'sto>,
-V: Stored<'sto>,
-J1: Storable<'sto, K>,
-J2: Storable<'sto, K>,
-U1: Storable<'sto, V>,
-U2: Storable<'sto, V>,
+K: Stored<'env>,
+V: Stored<'env>,
+J1: Storable<'env, K> + ?Sized,
+J2: Storable<'env, K> + ?Sized,
+U1: Storable<'env, V> + ?Sized,
+U2: Storable<'env, V> + ?Sized,
 {
     unsafe { std::mem::transmute(db) }
 }
 
-pub struct Db<'sto, K: Stored<'sto>, V: Stored<'sto>> {
-    pub(crate) sk_db: sanakirja::Db<Wrapper<'sto, K, K>, Wrapper<'sto, V, V>>,
-    pub(crate) storage: Storage<'sto>,
+/// A `Db<K, V>` is an immutable ordered map from `K` to `V`.
+pub struct Db<'env, K: Stored<'env>, V: Stored<'env>> {
+    pub(crate) sk_db: sanakirja::Db<Wrapper<'env, K, K>, Wrapper<'env, V, V>>,
+    pub(crate) storage: Storage<'env>,
 }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Copy for Db<'sto, K, V> { }
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Clone for Db<'sto, K, V> {
+impl<'env, K: Stored<'env>, V: Stored<'env>> Copy for Db<'env, K, V> { }
+impl<'env, K: Stored<'env>, V: Stored<'env>> Clone for Db<'env, K, V> {
     fn clone(&self) -> Self { *self }
 }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> std::fmt::Debug for Db<'sto, K, V> {
+impl<'env, K: Stored<'env>, V: Stored<'env>> std::fmt::Debug for Db<'env, K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "Db({:?})", self.sk_db.0)
     }
 }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> PartialEq for Db<'sto, K, V> {
+impl<'env, K: Stored<'env>, V: Stored<'env>> PartialEq for Db<'env, K, V> {
     fn eq(&self, other: &Self) -> bool {
         self.sk_db.0 == other.sk_db.0
             && self.storage.base == other.storage.base
     }
 }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Eq for Db<'sto, K, V> { }
+impl<'env, K: Stored<'env>, V: Stored<'env>> Eq for Db<'env, K, V> { }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> PartialOrd for Db<'sto, K, V> {
+impl<'env, K: Stored<'env>, V: Stored<'env>> PartialOrd for Db<'env, K, V> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.sk_db.0.partial_cmp(&other.sk_db.0)
     }
 }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Ord for Db<'sto, K, V> {
+impl<'env, K: Stored<'env>, V: Stored<'env>> Ord for Db<'env, K, V> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.sk_db.0.cmp(&other.sk_db.0)
     }
 }
 
-struct Iter<'a, 'sto: 'a, K: Stored<'sto>, V: Stored<'sto>, J: Storable<'sto, K>, U: Storable<'sto, V>> {
-    cursor: sanakirja::Cursor<'a, Storage<'sto>, Wrapper<'sto, K, J>, Wrapper<'sto, V, U>>,
-    storage: Storage<'sto>,
+struct Iter<'a, 'env: 'a, K: Stored<'env>, V: Stored<'env>, J: Storable<'env, K>, U: Storable<'env, V>> {
+    cursor: sanakirja::Cursor<'a, Storage<'env>, Wrapper<'env, K, J>, Wrapper<'env, V, U>>,
+    storage: Storage<'env>,
 }
 
-impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
-    /// Returns an iterator over all key/value pairs in the database.
+impl<'env, K: Stored<'env> + 'env, V: Stored<'env> + 'env> Db<'env, K, V> {
+    /// Returns an iterator over all key/value pairs in this map, in increasing order.
     pub fn iter<'a>(&'a self) -> impl Iterator<Item=(K, V)> + 'a {
         Iter {
             cursor: self.storage.iter(self.sk_db, None),
@@ -72,7 +73,7 @@ impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
 
     /// Returns an iterator over key/value pairs, starting with the first one whose key is at least
     /// `key`.
-    pub fn iter_from_key<'a, Q: Storable<'sto, K> + 'a>(&'a self, key: &Q)
+    pub fn iter_from_key<'a, Q: Storable<'env, K> + 'a>(&'a self, key: &Q)
     -> impl Iterator<Item=(K, V)> + 'a
     {
         let db = cast::<K, V, K, Q, V, V>(self.sk_db);
@@ -87,8 +88,8 @@ impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
     pub fn iter_from_key_value<'a, Q: 'a, R: 'a>(&'a self, key: &Q, val: &R)
     -> impl Iterator<Item=(K, V)> + 'a
     where
-    Q: Storable<'sto, K>,
-    R: Storable<'sto, V>,
+    Q: Storable<'env, K>,
+    R: Storable<'env, V>,
     {
         let db = cast(self.sk_db);
         Iter {
@@ -99,7 +100,7 @@ impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
 
     /// Gets the smallest value associated with `key`, if there is one.
     pub fn get<Q>(&self, key: &Q) -> Option<V>
-    where Q: Storable<'sto, K> + PartialEq<K>
+    where Q: Storable<'env, K> + PartialEq<K>
     {
         if let Some((k, v)) = self.iter_from_key(key).next() {
             if key.eq(&k) {
@@ -109,13 +110,17 @@ impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
         None
     }
 
-    /// Converts this `Db` to a writable one.
+    /// Creates a write-only copy of this map.
+    ///
+    /// Because of the way sanakirja does copy-on-write, this method is very fast (`O(1)`) and uses
+    /// almost no memory. If you actually start writing to the writable copy, you'll start using up
+    /// memory.
     ///
     /// # Panics
     ///
     /// Panics unless `txn`'s storage points to the same block of memory as `self.storage`.
-    pub fn writable_copy<'txn>(&self, txn: &'txn WriteTxn<'sto>) -> WriteDb<'txn, 'sto, K, V> {
-        //assert!(storage.base as *const u8 == self.storage.base);
+    pub fn writable_copy<'txn>(&self, txn: &'txn WriteTxn<'env>) -> WriteDb<'txn, 'env, K, V> {
+        assert_eq!(txn.storage().base, self.storage.base);
         WriteDb {
             sk_db: self.sk_db,
             txn: txn,
@@ -123,7 +128,7 @@ impl<'sto, K: Stored<'sto> + 'sto, V: Stored<'sto> + 'sto> Db<'sto, K, V> {
     }
 }
 
-impl<'a, 'sto, K: Stored<'sto>, V: Stored<'sto>, J: Storable<'sto, K>, U: Storable<'sto, V>> Iterator for Iter<'a, 'sto, K, V, J, U> {
+impl<'a, 'env, K: Stored<'env>, V: Stored<'env>, J: Storable<'env, K>, U: Storable<'env, V>> Iterator for Iter<'a, 'env, K, V, J, U> {
     type Item = (K, V);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -149,7 +154,7 @@ impl StoredHeader for DbHeader {
     }
 }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Stored<'sto> for Db<'sto, K, V> {
+impl<'env, K: Stored<'env>, V: Stored<'env>> Stored<'env> for Db<'env, K, V> {
     fn alignment() -> Alignment { Alignment::B8 }
     type Header = DbHeader;
 
@@ -157,7 +162,7 @@ impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Stored<'sto> for Db<'sto, K, V> {
         DbHeader { page_offset: self.sk_db.0 }
     }
 
-    fn read_value(buf: &[u8], s: &Storage<'sto>) -> Self {
+    fn read_value(buf: &[u8], s: &Storage<'env>) -> Self {
         Db {
             sk_db: unsafe { sanakirja::Db::read_value(buf.as_ptr()) },
             storage: *s,
@@ -179,58 +184,74 @@ impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Stored<'sto> for Db<'sto, K, V> {
     }
 }
 
-impl<'sto, K: Stored<'sto>, V: Stored<'sto>> Storable<'sto, Db<'sto, K, V>> for Db<'sto, K, V> {
+impl<'env, K: Stored<'env>, V: Stored<'env>> Storable<'env, Db<'env, K, V>> for Db<'env, K, V> {
     fn store(&self, _: &mut Alloc) -> Result<Self> { Ok(*self) }
 }
 
-#[derive(Clone, Copy)]
-pub struct WriteDb<'txn, 'sto: 'txn, K: Stored<'sto>, V: Stored<'sto>> {
-    pub(crate) sk_db: sanakirja::Db<Wrapper<'sto, K, K>, Wrapper<'sto, V, V>>,
-    pub(crate) txn: &'txn WriteTxn<'sto>,
+/// A `WriteDb<K, V>` is a write-only ordered map from `K` to `V`.
+///
+/// We realize that a write-only map seems pretty useless, but it's actually crucial to the safe
+/// usage of this crate, because of the following two points:
+///
+/// * we have no way to prevent you from obtaining multiple handles pointing to the same database;
+///   and
+/// * references into a `WriteDb` are prone to being invalidated by modifications to that
+///   `WriteDb`.
+///
+/// Our strategy for avoiding memory unsafety is to never give you read access to a database unless
+/// it's contained in a snapshot. With that in mind:
+///
+/// * If you want to read from one map and write to another, then open a writer, `snapshot` it to
+///   get a reader, then read from the reader while writing to the writer.
+/// * If you want to interleave reads and writes to the same map, you'll need to take a snapshot
+///   each time you're finished writing and want to start reading again.
+pub struct WriteDb<'txn, 'env: 'txn, K: Stored<'env>, V: Stored<'env>> {
+    pub(crate) sk_db: sanakirja::Db<Wrapper<'env, K, K>, Wrapper<'env, V, V>>,
+    pub(crate) txn: &'txn WriteTxn<'env>,
 }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> std::fmt::Debug for WriteDb<'txn, 'sto, K, V> {
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> std::fmt::Debug for WriteDb<'txn, 'env, K, V> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "WriteDb({:?})", self.sk_db.0)
     }
 }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> PartialEq for WriteDb<'txn, 'sto, K, V> {
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> PartialEq for WriteDb<'txn, 'env, K, V> {
     fn eq(&self, other: &Self) -> bool {
         self.sk_db.0 == other.sk_db.0
             && self.txn.storage().base == other.txn.storage().base
     }
 }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> Eq for WriteDb<'txn, 'sto, K, V> { }
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> Eq for WriteDb<'txn, 'env, K, V> { }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> PartialOrd for WriteDb<'txn, 'sto, K, V> {
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> PartialOrd for WriteDb<'txn, 'env, K, V> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         self.sk_db.0.partial_cmp(&other.sk_db.0)
     }
 }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> PartialEq<Db<'sto, K, V>> for WriteDb<'txn, 'sto, K, V> {
-    fn eq(&self, other: &Db<'sto, K, V>) -> bool {
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> PartialEq<Db<'env, K, V>> for WriteDb<'txn, 'env, K, V> {
+    fn eq(&self, other: &Db<'env, K, V>) -> bool {
         self.sk_db.0 == other.sk_db.0
             && self.txn.storage().base as *const u8 == other.storage.base
     }
 }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> PartialOrd<Db<'sto, K, V>> for WriteDb<'txn, 'sto, K, V> {
-    fn partial_cmp(&self, other: &Db<'sto, K, V>) -> Option<std::cmp::Ordering> {
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> PartialOrd<Db<'env, K, V>> for WriteDb<'txn, 'env, K, V> {
+    fn partial_cmp(&self, other: &Db<'env, K, V>) -> Option<std::cmp::Ordering> {
         self.sk_db.0.partial_cmp(&other.sk_db.0)
     }
 }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> Ord for WriteDb<'txn, 'sto, K, V> {
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> Ord for WriteDb<'txn, 'env, K, V> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.sk_db.0.cmp(&other.sk_db.0)
     }
 }
 
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> Storable<'sto, Db<'sto, K, V>> for WriteDb<'txn, 'sto, K, V> {
-    fn store(&self, _: &mut Alloc) -> Result<Db<'sto, K, V>> {
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> Storable<'env, Db<'env, K, V>> for WriteDb<'txn, 'env, K, V> {
+    fn store(&self, _: &mut Alloc) -> Result<Db<'env, K, V>> {
         Ok(Db {
             sk_db: self.sk_db,
             storage: self.txn.storage(),
@@ -238,35 +259,76 @@ impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> Storable<'sto, Db<'sto, K, V>
     }
 }
 
-// As the name suggests, you can write to a WriteDb. But you can't read from one, or turn it back
-// into a readable Db, because the storage underlying a WriteDb is prone to invalidation.
-impl<'txn, 'sto, K: Stored<'sto>, V: Stored<'sto>> WriteDb<'txn, 'sto, K, V> {
-    // TODO: return an enum to indicate whether the binding existed already
-    pub fn insert<J: Storable<'sto, K>, U: Storable<'sto, V>>(&mut self, key: J, val: U) -> Result<()> {
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> WriteDb<'txn, 'env, K, V> {
+    /// Inserts a binding into this map, returning `true` if a new binding was creating and `false`
+    /// if the binding already existed.
+    ///
+    /// Note that we support multiple values associated to the same key. In particular, we only
+    /// return false if this exact `(key, value)` pair was present before.
+    pub fn insert<J: Storable<'env, K> + ?Sized, U: Storable<'env, V> + ?Sized>(&mut self, key: &J, val: &U) -> Result<bool> {
         let key: K = key.store(&mut self.txn.allocator())?;
         let val: V = val.store(&mut self.txn.allocator())?;
-        self.txn.with_mut_txn(|txn|
+        Ok(self.txn.with_mut_txn(|txn|
             txn.put(&mut rand::thread_rng(), &mut self.sk_db, Wrapper::wrap(&key), Wrapper::wrap(&val))
-        )?;
-        Ok(())
+        )?)
     }
 
-    pub fn remove_first<J: Storable<'sto, K>>(&mut self, key: &J) -> Result<()> {
+    /// Removes the first binding associated with `key`, returning `true` if there was a binding
+    /// associated with `key`.
+    pub fn remove_first<J: Storable<'env, K> + ?Sized>(&mut self, key: &J) -> Result<bool> {
         let mut db = cast::<K, V, K, J, V, V>(self.sk_db);
-        self.txn.with_mut_txn(|txn|
+        let ret = self.txn.with_mut_txn(|txn|
             txn.del(&mut rand::thread_rng(), &mut db, Wrapper::search(key), None)
         )?;
         self.sk_db = cast(db);
-        Ok(())
+        Ok(ret)
     }
 
-    pub fn remove_pair<J: Storable<'sto, K>, U: Storable<'sto, V>>(&mut self, key: &K, val: &V)
-    -> Result<()> {
+    /// Removes the binding `(key, val)` if it exists, returning `true` if it existed.
+    pub fn remove_pair<J: Storable<'env, K> + ?Sized, U: Storable<'env, V> + ?Sized>(&mut self, key: &J, val: &U)
+    -> Result<bool> {
         let mut db = cast(self.sk_db);
-        self.txn.with_mut_txn(|txn|
+        let ret = self.txn.with_mut_txn(|txn|
             txn.del(&mut rand::thread_rng(), &mut db, Wrapper::search(key), Some(Wrapper::search(val)))
         )?;
         self.sk_db = cast(db);
-        Ok(())
+        Ok(ret)
+    }
+}
+
+/// A `RootWriteDb` is like a `WriteDb`, except that it's stored at a fixed location in the root of
+/// the environment.
+pub struct RootWriteDb<'txn, 'env: 'txn, K: Stored<'env>, V: Stored<'env>> {
+    pub(crate) idx: usize,
+    pub(crate) db: WriteDb<'txn, 'env, K, V>,
+}
+
+impl<'txn, 'env, K: Stored<'env>, V: Stored<'env>> RootWriteDb<'txn, 'env, K, V> {
+    /// Inserts a binding into this map, returning `true` if a new binding was creating and `false`
+    /// if the binding already existed.
+    ///
+    /// Note that we support multiple values associated to the same key. In particular, we only
+    /// return false if this exact `(key, value)` pair was present before.
+    pub fn insert<J: Storable<'env, K> + ?Sized, U: Storable<'env, V> + ?Sized>(&mut self, key: &J, val: &U) -> Result<bool> {
+        self.db.insert(key, val)
+    }
+
+    /// Removes the first binding associated with `key`, returning `true` if there was a binding
+    /// associated with `key`.
+    pub fn remove_first<J: Storable<'env, K> + ?Sized>(&mut self, key: &J) -> Result<bool> {
+        self.db.remove_first(key)
+    }
+
+    /// Removes the binding `(key, val)` if it exists, returning `true` if it existed.
+    pub fn remove_pair<J: Storable<'env, K> + ?Sized, U: Storable<'env, V> + ?Sized>(&mut self, key: &J, val: &U)
+    -> Result<bool> {
+        self.db.remove_pair(key, val)
+    }
+}
+
+impl<'txn, 'env: 'txn, K: Stored<'env>, V: Stored<'env>> Drop for RootWriteDb<'txn, 'env, K, V> {
+    fn drop(&mut self) {
+        self.db.txn.set_root_db(self.idx, &self.db);
+        self.db.txn.borrowed_roots.borrow_mut().remove(&self.idx);
     }
 }

@@ -18,6 +18,14 @@ impl StoredHeader for LargeBufHeader {
     }
 }
 
+/// A large buffer, stored in a sanakirja database.
+///
+/// This is a "borrowed" type, in the sense that the actual buffer lives in the database, and this
+/// object is just a reference to it. So you can copy and clone a `LargeBuf` pretty efficiently,
+/// but it can't outlive the database it's stored in.
+///
+/// A `LargeBuf` always allocates at least one (4096-byte) page for its storage, so it's a waste of
+/// space to use one for buffers that are usually small.
 #[derive(Clone, Copy, Debug)]
 pub struct LargeBuf<'sto> {
     storage: Storage<'sto>,
@@ -47,6 +55,10 @@ impl<'sto> Iterator for LargeBufIter<'sto> {
 }
 
 impl<'sto> LargeBuf<'sto> {
+    /// Returns an iterator over chunks of my bytes.
+    ///
+    /// Since a `LargeBuf` is not stored as one contiguous chunk of memory, you can't just get a
+    /// single slice representing the whole buffer.
     pub fn iter(&self) -> impl Iterator<Item=&'sto [u8]> {
         LargeBufIter {
             storage: self.storage,
@@ -111,6 +123,7 @@ impl<'sto> Stored<'sto> for LargeBuf<'sto> {
     }
 }
 
+// TODO: this doesn't work for moving a LargeBuf between databases
 impl<'sto> Storable<'sto, LargeBuf<'sto>> for LargeBuf<'sto> {
     fn store<'a>(&self, _: &mut Alloc<'a, 'sto>) -> Result<Self> { Ok(*self) }
 }
@@ -129,13 +142,14 @@ impl<'sto> PartialOrd<LargeBuf<'sto>> for [u8] {
 
 impl<'sto> Storable<'sto, LargeBuf<'sto>> for [u8] {
     fn store<'a>(&self, alloc: &mut Alloc<'a, 'sto>) -> Result<LargeBuf<'sto>> {
-        let chunk_len = PAGE_SIZE as usize - 8;
+        let mut chunk_len = PAGE_SIZE as usize - 8;
         let mut me = self;
         let mut prev_page: Option<MutPage> = None;
         let mut first_offset: Option<usize> = None;
         while !me.is_empty() {
             let mut page = alloc.alloc_page()?;
-            page.buf()[8..].copy_from_slice(&me[..chunk_len]);
+            chunk_len = std::cmp::min(chunk_len, me.len());
+            page.buf()[8..(chunk_len + 8)].copy_from_slice(&me[..chunk_len]);
             me = &me[chunk_len..];
 
             // Build the linked list of pages by writing the offset of the new page at the

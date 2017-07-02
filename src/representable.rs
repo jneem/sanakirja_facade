@@ -1,6 +1,7 @@
 use byteorder::{ByteOrder, LittleEndian};
 use rand::Rng;
 use sanakirja;
+use sanakirja::LoadPage;
 use std;
 use std::cmp::Ordering;
 use std::fmt::Debug;
@@ -21,23 +22,10 @@ pub trait StoredHeader: Copy {
     fn onpage_size(&self) -> u16;
 }
 
-// Here is how representing things should work:
-//
-// There is a trait representing things that are stored in a database. This includes things like
-// page_offsets and drop_value. Call this trait Stored, for now.
-//
-// A database is parametrized over the types that are stored in it. That is, it's a
-// Db<K: Stored, V: Stored>.
-//
-// In order to look up something in a Db<K, V>, you just need a type that's Ord<K>.
-//
-// There's another trait representing things that can be written to a database. Call it
-// Storable<T: Stored> for now, where S: Storable<T: Stored> means that S can be written to a
-// database that stores things of type T.
-
 /// This is the trait for objects that are stored in a database. They should be fairly small, or
 /// else it will be costly to read and write them. However, since they can also store references
-/// into the database, you can implement `Stored` for a view into a large buffer.
+/// into the database, you can implement `Stored` for a "reference" into a large buffer that is
+/// stored in the database.
 pub trait Stored<'sto>: Storable<'sto, Self> + Sized {
     /// This is the metadata associated with this type.
     type Header: StoredHeader;
@@ -118,7 +106,11 @@ impl<'sto> Stored<'sto> for u64 {
     }
 }
 
-pub(crate) enum Wrapper<'sto, S: Stored<'sto>, T> {
+// Wrap a Stored in a Wrapper to make it sanakirja::Representable.
+//
+// We also take another parameter, `T`. This is a hack to let us search in sanakirja databases
+// using something that's comparable to the stored type, but not equal to it.
+pub(crate) enum Wrapper<'sto, S: Stored<'sto>, T: ?Sized> {
     // sanakirja::Representable requires Copy, but Stored and T don't. So we can't store S or T
     // here, but only a pointer. This means we need to be careful not to use the pointer for too
     // long.
@@ -135,14 +127,17 @@ pub(crate) enum Wrapper<'sto, S: Stored<'sto>, T> {
         ptr: *const u8,
         marker: PhantomData<(S, &'sto ())>,
     },
-    // This is a hack to allow searching for Stored types using something that can be compared to
-    // them.
     Searcher {
         ptr: *const T,
     }
 }
 
-impl<'sto, S: Stored<'sto>, T> Wrapper<'sto, S, T> {
+impl<'sto, S: Stored<'sto>, T: ?Sized> Wrapper<'sto, S, T> {
+    /// Given a `Wrapper` that's stored in the database, return the corresponding `Stored`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the wrapper is wrapping something that isn't stored in the database.
     pub unsafe fn to_stored(&self, storage: &Storage<'sto>) -> S {
         match *self {
             Wrapper::OnPage { ptr, .. } => {
@@ -156,16 +151,22 @@ impl<'sto, S: Stored<'sto>, T> Wrapper<'sto, S, T> {
         }
     }
 
+    /// Wraps a `Stored`.
     pub fn wrap(val: &S) -> Wrapper<'sto, S, T> {
         Wrapper::OffPage { ptr: val as *const S }
     }
 
+    /// Wraps something for searching.
+    ///
+    /// You need to be careful when using the resulting `Wrapper`, since most of the functions in
+    /// `impl Representable for Wrapper` panic when they see this kind of wrapper. Basically, you
+    /// can only use this `Wrapper` for searching in a database, and not for inserting.
     pub fn search(val: &T) -> Wrapper<'sto, S, T> {
         Wrapper::Searcher { ptr: val as *const T }
     }
 }
 
-impl<'sto, S: Stored<'sto>, T> Debug for Wrapper<'sto, S, T> {
+impl<'sto, S: Stored<'sto>, T: ?Sized> Debug for Wrapper<'sto, S, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::result::Result<(), std::fmt::Error> {
         match *self {
             Wrapper::OffPage { ptr } => f.write_fmt(format_args!("OffPage({:?})", ptr)),
@@ -175,9 +176,9 @@ impl<'sto, S: Stored<'sto>, T> Debug for Wrapper<'sto, S, T> {
     }
 }
 
-impl<'sto, S: Stored<'sto>, T> Copy for Wrapper<'sto, S, T> { }
+impl<'sto, S: Stored<'sto>, T: ?Sized> Copy for Wrapper<'sto, S, T> { }
 
-impl<'sto, S: Stored<'sto>, T> Clone for Wrapper<'sto, S, T> {
+impl<'sto, S: Stored<'sto>, T: ?Sized> Clone for Wrapper<'sto, S, T> {
     fn clone(&self) -> Self { *self }
 }
 
@@ -199,25 +200,13 @@ unsafe fn mk_mut_slice<'a>(p: *mut u8, mut len: usize) -> &'a mut [u8] {
     std::slice::from_raw_parts_mut(p, len)
 }
 
-unsafe fn read_stored<'sto, S, L>(ptr: *const u8, loader: &L) -> S
-where
-S: Stored<'sto>,
-L: sanakirja::LoadPage,
-{
-    let size = S::read_header(mk_slice(ptr, PAGE_SIZE)).onpage_size();
-    let slice = mk_slice(ptr, size as usize);
-
-    // Find the storage buffer underlying `loader` and make a `Storage` struct out of it.
-    let base = loader.load_page(0).data as *mut u8;
-    // The cast is ok: when we open the transaction we ensure that its length fits in a usize.
-    let storage = Storage { base, len: loader.len() as usize, marker: PhantomData };
-    S::read_value(slice, &storage)
- }
-
+// This is our main interface to sanakirja. Every one of our `Stored` types gets put in a `Wrapper`
+// in order to hand it to sanakirja for storing. The `Wrapper` implements
+// `sanakirja::Representable`, mainly by forwarding things to functions defined in `Stored`.
 impl<'sto, S, T> sanakirja::Representable for Wrapper<'sto, S, T>
 where
 S: Stored<'sto>,
-T: Storable<'sto, S>,
+T: Storable<'sto, S> + ?Sized,
 {
     type PageOffsets = <<S as Stored<'sto>>::Header as StoredHeader>::PageOffsets;
     fn page_offsets(&self) -> Self::PageOffsets {
@@ -270,7 +259,13 @@ T: Storable<'sto, S>,
 
     unsafe fn cmp_value<Tn: sanakirja::LoadPage>(&self, txn: &Tn, x: Self) -> Ordering {
         use self::Wrapper::*;
-        let read = |ptr: *const u8| read_stored::<S, Tn>(ptr, txn);
+
+        let base = txn.load_page(0).data as *mut u8;
+        let storage = Storage { base, len: txn.len() as usize, marker: PhantomData };
+
+        let read = |ptr: *const u8| {
+            OnPage::<S, T> { ptr, marker: std::marker::PhantomData }.to_stored(&storage)
+        };
         match (*self, x) {
             (OnPage { ptr: p, .. }, OffPage { ptr: q }) => (*q).partial_cmp(&read(p)).unwrap(),
             (OffPage { ptr: p }, OnPage { ptr: q, .. }) => (*p).partial_cmp(&read(q)).unwrap(),
@@ -291,10 +286,12 @@ T: Storable<'sto, S>,
     }
 
     fn drop_value<R: Rng>(&self, txn: &mut sanakirja::MutTxn, _: &mut R) -> Result<()> {
+        let base = txn.load_page(0).data as *mut u8;
+        let storage = Storage { base, len: txn.len() as usize, marker: PhantomData };
         unsafe {
             match *self {
-                Wrapper::OnPage { ptr: p, .. } => {
-                    let val = read_stored::<S, _>(p, txn);
+                w@Wrapper::OnPage { .. } => {
+                    let val = w.to_stored(&storage);
                     // The sanakirja interface doesn't give us any control over the lifetime of the
                     // storage, so we need to hack it in with a transmute.
                     let txn: &mut sanakirja::MutTxn<'sto> = std::mem::transmute(txn);

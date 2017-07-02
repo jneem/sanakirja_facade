@@ -40,6 +40,9 @@ pub enum Error {
 
     /// You tried to create a mutable transaction while another one was active.
     MultipleWriters,
+
+    /// Sanakirja detected an inconsistency (or possible corruption) in the database.
+    Inconsistency,
 }
 
 impl std::fmt::Display for Error {
@@ -53,6 +56,8 @@ impl std::fmt::Display for Error {
             Error::Poison => write!(f, "Lock poisoning error"),
             Error::MultipleWriters =>
                 write!(f, "You tried to create a multable transaction while another one was active"),
+            Error::Inconsistency =>
+                write!(f, "Possible database corruption detected"),
         }
     }
 }
@@ -66,6 +71,7 @@ impl std::error::Error for Error {
             }
             Error::Poison => "Poison error",
             Error::MultipleWriters => "Multiple writers",
+            Error::Inconsistency => "Database inconsistency",
         }
     }
     fn cause(&self) -> Option<&std::error::Error> {
@@ -74,6 +80,7 @@ impl std::error::Error for Error {
             Error::NotEnoughSpace => None,
             Error::Poison => None,
             Error::MultipleWriters => None,
+            Error::Inconsistency => None,
         }
     }
 }

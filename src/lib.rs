@@ -1,13 +1,116 @@
 #![feature(conservative_impl_trait, try_from)]
 
-extern crate byteorder;
-extern crate either;
-extern crate rand;
-extern crate sanakirja;
+//! `sanakirja_facade` is a strongly typed, (hopefully) safe interface for a persistent, fast
+//! key-value store (namely, [sanakirja](https://pijul.com/documentation/sanakirja/)).
+//!
+//! # Overview
+//!
+//! `sanakirja_facade` is transactional: writes either completely succeed or completely fail, with
+//! no changes made. Data can be read while a write transaction is in process, and they will not
+//! see any of the pending changes. When the write transaction wants to commit its changes, it
+//! will need to wait until all read transactions are finished.
+//!
+//! In contrast to databases like BerkeleyDB and LMDB, `sanakirja_facade` has a strongly-typed
+//! interface. That is, `sanakirja_facade` allows you to store and retrieve native rust types,
+//! instead of requiring you to serialize everything as byte arrays. You can even extend the
+//! universe of types that `sanakirja_facade` knows how to store.
+//!
+//! For managing its storage, `sanakirja_facade` borrows a technique popularized by
+//! [LMDB](https://symas.com/lightning-memory-mapped-database/): the database file is mapped into
+//! a large, contiguous chunk of memory. This is simple and very efficient, but it has one
+//! implication that you should know about: when you first open the database environment, you get
+//! to decide how large the memory mapping is. (Equivalently, you need to put an upper bound on how
+//! large the database is allowed to grow.) This limitation exists because it isn't possible to
+//! (portably and reliably) *grow* memory mappings once they've been made.
+//!
+//! # Using
+//!
+//! ## The strongly typed interface
+//!
+//! There are two interfaces to `sanakirja_facade`, one of which is more strongly-typed than the
+//! other. To use the strongly typed interface, you will need to add a dependency on the
+//! `sanakirja_facade_derive` crate, possibly by adding
+//!
+//! ```text
+//! [dependencies]
+//! sanakirja_facade_derive = "0.1.0"
+//! ```
+//!
+//! to your `Cargo.toml` file, and then adding
+//!
+//! ```text
+//! #[macro_use] extern crate sanakirja_facade_derive;
+//! ```
+//!
+//! at the top-level of your crate. Once you've done that, you can auto-derive your own strongly
+//! typed database interfaces like this:
+//!
+//! ```
+//! # extern crate sanakirja_facade;
+//! # #[macro_use] extern crate sanakirja_facade_derive;
+//! use sanakirja_facade::*;
+//!
+//! // This #[derive(TypedEnv)] creates three new structs: `MyEnv`, `MyReader`, and `MyWriter`.
+//! //
+//! // `MyEnv` is a bit like `Env`, except that the `reader()` function returns a `MyReader` and
+//! // the `writer()` function returns a `MyWriter`.
+//! //
+//! // `MyReader` is a bit like `ReadTxn`, except that instead of accessing the root databases
+//! // using numeric indices, there are non-generic, named functions for accessing both of the
+//! // root databases that we declare below.
+//! //
+//! // `MyWriter` is a bit like `WriteTxn`, except that it also uses named functions instead of
+//! // indices for accessing the root databases.
+//! #[derive(TypedEnv)]
+//! struct MySchema<'env> {
+//!     // The first map in my environment maps from `u64`s to large buffers.
+//!     my_first_db: Db<'env, u64, sanakirja_facade::LargeBuf<'env>>,
+//!     // Dbs can be nested in other Dbs.
+//!     my_nested_db: Db<'env, u64, Db<'env, u64, u64>>,
+//! }
+//!
+//! fn main() {
+//!     // Create an empty, memory-backed database. You can also use `MyEnv::open` to open or
+//!     // create a file-backed one.
+//!     let env = MyEnv::open_anonymous(PAGE_SIZE * 100).unwrap();
+//!     let writer = env.writer().unwrap();
+//!     writer.my_first_db().insert(&123, &b"Here's a buffer with text in it."[..]).unwrap();
+//!
+//!     // In order to write nested Dbs into our database, we need to create them first.
+//!     let mut db = writer.create_db().unwrap();
+//!     db.insert(&7, &8).unwrap();
+//!     writer.my_nested_db().insert(&234, &db).unwrap();
+//!
+//!     // If we were to call env.reader(), it would look as though our database were empty.
+//!     // That's because of sanakirja's transactional approach. If we want to actually see
+//!     // the data that // we just inserted, we can either call `writer.snapshot()` to get
+//!     // a reader with a snapshot of the current state, or we can call `writer.commit()` to
+//!     // finish our transaction before getting a reader with `env.reader()`. Let's do the
+//!     // first option:
+//!     let reader = writer.snapshot();
+//!     let buf = reader.my_first_db().get(&123).unwrap();
+//!     //assert_eq!(buf.iter().next().unwrap(), &b"Here's a buffer with text in it."[..]);
+//!     //let db = reader.my_nested_db().get(&234).unwrap();
+//!     //assert_eq!(db.get(&7), Some(8));
+//! }
+//! ```
+//!
+//! ## The weakly typed interface
+//!
+//! This section is not written yet...
+//!
+//! # Extending
+//!
+//! This section is not written yet...
 
-use sanakirja::{LoadPage, Transaction};
+extern crate byteorder;
+extern crate rand;
+
+pub extern crate sanakirja;
+
+use sanakirja::{Commit, LoadPage, Transaction};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -19,9 +122,9 @@ mod representable;
 use representable::Wrapper;
 
 pub use buf::LargeBuf;
-pub use db::{Db, WriteDb};
+pub use db::{Db, RootWriteDb, WriteDb};
 pub use representable::{StoredHeader, Storable, Stored};
-pub use sanakirja::{Alignment, Commit};
+pub use sanakirja::Alignment;
 pub type Error = sanakirja::Error;
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -33,14 +136,14 @@ const ZERO_HEADER: isize = 24;
 /// The main thing you can do with a `Storage` is to request `PAGE_SIZE`-sized chunks of
 /// (read-only) memory.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct Storage<'sto> {
+pub struct Storage<'env> {
     base: *mut u8,
     len: usize,
-    marker: PhantomData<&'sto u8>,
+    marker: PhantomData<&'env u8>,
 }
 
-impl<'sto> Storage<'sto> {
-    pub fn get_page(&self, offset: usize) -> &'sto [u8] {
+impl<'env> Storage<'env> {
+    pub fn get_page(&self, offset: usize) -> &'env [u8] {
         if offset % (PAGE_SIZE as usize) != 0 {
             panic!("tried to load an unaligned page");
         }
@@ -54,7 +157,7 @@ impl<'sto> Storage<'sto> {
     }
 }
 
-impl<'sto> LoadPage for Storage<'sto> {
+impl<'env> LoadPage for Storage<'env> {
     fn load_page(&self, off: u64) -> sanakirja::Page {
         assert!(off < self.len as u64);
         unsafe {
@@ -83,13 +186,13 @@ impl<'sto> LoadPage for Storage<'sto> {
 /// careful what you do with this memory, and only write to the parts of it that you "own."
 /// Writing elsewhere could cause database corruption (although not memory unsafety).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MutStorage<'sto> {
+struct MutStorage<'env> {
     base: *mut u8,
     len: usize,
-    marker: PhantomData<&'sto u8>,
+    marker: PhantomData<&'env u8>,
 }
 
-impl<'sto> LoadPage for MutStorage<'sto> {
+impl<'env> LoadPage for MutStorage<'env> {
     fn load_page(&self, off: u64) -> sanakirja::Page {
         assert!(off < self.len as u64);
         unsafe {
@@ -112,38 +215,56 @@ impl<'sto> LoadPage for MutStorage<'sto> {
     }
 }
 
-impl<'sto> sanakirja::skiplist::SkipList for Storage<'sto> {}
-impl<'sto> sanakirja::Transaction for Storage<'sto> {}
-impl<'sto> sanakirja::skiplist::SkipList for MutStorage<'sto> {}
-impl<'sto> sanakirja::Transaction for MutStorage<'sto> {}
+impl<'env> sanakirja::skiplist::SkipList for Storage<'env> {}
+impl<'env> sanakirja::Transaction for Storage<'env> {}
+impl<'env> sanakirja::skiplist::SkipList for MutStorage<'env> {}
+impl<'env> sanakirja::Transaction for MutStorage<'env> {}
 
 /// The size of a page in the database. This may not be the same as the page size of the underlying
 /// platform.
 pub const PAGE_SIZE: usize = 4096;
 
-pub struct MutPage<'sto> {
-    storage: Storage<'sto>,
+/// A reference to a mutable page in the database.
+///
+/// We promise that at any time, there is only one live `MutPage` pointing to any one page.
+#[derive(Debug)]
+pub struct MutPage<'env> {
+    storage: Storage<'env>,
     offset: usize,
 }
 
-impl<'sto> MutPage<'sto> {
+impl<'env> MutPage<'env> {
+    /// Returns this page as a mutable slice, which is guaranteed to have length `PAGE_SIZE`.
     pub fn buf(&mut self) -> &mut [u8] {
         unsafe {
             std::slice::from_raw_parts_mut(self.storage.base.offset(self.offset as isize), PAGE_SIZE)
         }
     }
 
+    /// Returns the offset (measured from the start of the environment's backing memory) of this
+    /// page. This is guaranteed to be a multiple of `PAGE_SIZE`.
     pub fn offset(&self) -> usize {
         self.offset
     }
 }
 
-pub struct Alloc<'a, 'sto: 'a> {
-    txn: &'a WriteTxn<'sto>
+/// You'll need to know about `Alloc` if you want to write your own advanced impls for `Stored`.
+///
+/// Specifically, suppose you want to implement `Stored` for a "borrow" into a large chunk of
+/// memory that's stored in the database. In this case, you will need to allocated and fill that
+/// memory at some point. That's what this `Alloc` struct is for: you will get access to one when
+/// you implement `Storable::store`, and you can use it to request free, `PAGE_SIZE`-sized chunks
+/// of memory.
+///
+/// For a higher-level overview on implementing `Stored`, see the crate documentation.
+pub struct Alloc<'a, 'env: 'a> {
+    txn: &'a WriteTxn<'env>
 }
 
-impl<'a, 'sto: 'a> Alloc<'a, 'sto> {
-    pub fn alloc_page(&mut self) -> Result<MutPage<'sto>> {
+impl<'a, 'env: 'a> Alloc<'a, 'env> {
+    /// Allocate a `PAGE_SIZE`-sized chunk of memory in the database. Don't forget to free it when
+    /// you're done (probably in the `Stored::drop_value` function)!
+    pub fn alloc_page(&mut self) -> Result<MutPage<'env>> {
         let sk_page = self.txn.with_mut_txn(|txn| txn.alloc_page())?;
         Ok(MutPage {
             storage: self.txn.storage(),
@@ -151,11 +272,24 @@ impl<'a, 'sto: 'a> Alloc<'a, 'sto> {
         })
     }
 
+    /// Free the page at offset `offset`, which must be a multiple of `PAGE_SIZE`.
+    ///
+    /// You need to be careful to free only pages which are no longer in use; otherwise, you could
+    /// cause database corruption.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `offset` is not a multiple of `PAGE_SIZE`, or if it points past the end of the
+    /// database.
     pub fn free_page(&mut self, offset: usize) {
+        if offset % PAGE_SIZE != 0 {
+            panic!("offset must be a multiple of PAGE_SIZE");
+        }
         self.txn.with_mut_txn(|txn| unsafe { txn.free_page(offset as u64) });
     }
 
-    pub fn storage(&self) -> Storage<'sto> {
+    /// Returns the storage underlying this allocator.
+    pub fn storage(&self) -> Storage<'env> {
         self.txn.storage()
     }
 }
@@ -178,25 +312,25 @@ pub struct Env {
 ///
 /// In order to do anything useful with a `ReadTxn`, you'll want to retrieve a `Db` using
 /// `ReadTxn::root_db`.
-pub struct ReadTxn<'sto> {
-    storage: Storage<'sto>,
+pub struct ReadTxn<'env> {
+    storage: Storage<'env>,
     // This is useful for a ReadTxn that's obtained from snapshotting a WriteTxn. In that case, the
     // WriteTxn probably has some modified root Dbs, meaning that the modified Dbs' first pages are
     // not stored in the first page of the storage. Here, we keep track of where they actually are.
     roots: HashMap<usize, u64>,
 }
 
-enum WrappedTxn<'sto> {
+enum WrappedTxn<'env> {
     // The empty variant is needed because at some point we need to move the MutTxn out of a
     // RefCell, and we need a temporary value to put there before moving a different MutTxn back
     // in. But you should basically never expect to see a WrappedTxn::Empty.
     Empty,
-    Owned(sanakirja::MutTxn<'sto>),
+    Owned(sanakirja::MutTxn<'env>),
     // We use a pointer here instead of a borrow to avoid having an extra lifetime parameter. In
     // order to maintain memory safety, you need to be careful not to let a WrappedTxn::Borrowed
     // last too long. Fortunately, we only create them in one place:
     // (namely, <Wrapper as Representable>::drop_value).
-    Borrowed(*mut sanakirja::MutTxn<'sto>),
+    Borrowed(*mut sanakirja::MutTxn<'env>),
 }
 
 /// A write-only view into an environment.
@@ -204,8 +338,11 @@ enum WrappedTxn<'sto> {
 /// There can only be one simultaneous write-only view to any environment, but read-only views
 /// (i.e. `ReadTxn`s) can co-exist with a `WriteTxn`. In this case, the `ReadTxn`s will see stale
 /// data: any modifications made by the `WriteTxn` will not be reflected in the `ReadTxn`s.
-pub struct WriteTxn<'sto> {
-    sk_txn: RefCell<WrappedTxn<'sto>>
+pub struct WriteTxn<'env> {
+    sk_txn: RefCell<WrappedTxn<'env>>,
+    // We only allow one copy of a RootWriteDb at a time. Here, we maintain a list of outstanding
+    // borrows.
+    borrowed_roots: RefCell<HashSet<usize>>,
 }
 
 impl Env {
@@ -219,18 +356,18 @@ impl Env {
     ///
     /// `max_length` specifies the maximum size (in bytes) that the database may grow to. This can
     /// be made very large without any performance penalty.
-    pub fn open<P: AsRef<Path>>(path: P, max_length: u64) -> Result<Env> {
+    pub fn open<P: AsRef<Path>>(path: P, max_length: usize) -> Result<Env> {
         Ok(Env {
-            sk_env: Box::new(sanakirja::Env::new(path, max_length)?)
+            sk_env: Box::new(sanakirja::Env::new(path, max_length as u64)?)
         })
     }
 
     /// Creates a new environment that is backed by memory only.
     ///
     /// This is mainly useful for testing.
-    pub fn memory_backed(length: u64) -> Result<Env> {
+    pub fn open_anonymous(length: usize) -> Result<Env> {
         Ok(Env {
-            sk_env: Box::new(sanakirja::Env::new_memory_backed(length)?)
+            sk_env: Box::new(sanakirja::Env::new_memory_backed(length as u64)?)
         })
     }
 
@@ -254,7 +391,7 @@ impl Env {
     /// try to open a second writer, this method will return an error:
     ///
     /// ```
-    /// # let env = sanakirja_facade::Env::memory_backed(4096).unwrap();
+    /// # let env = sanakirja_facade::Env::open_anonymous(4096).unwrap();
     /// let first = env.writer();
     /// let second = env.writer();
     /// assert!(first.is_ok());
@@ -263,12 +400,13 @@ impl Env {
     pub fn writer<'env>(&'env self) -> Result<WriteTxn<'env>> {
         Ok(WriteTxn {
             sk_txn: RefCell::new(WrappedTxn::Owned(self.sk_env.mut_txn_begin()?)),
+            borrowed_roots: RefCell::new(HashSet::new()),
         })
     }
 }
 
-impl<'sto> ReadTxn<'sto> {
-    pub(crate) fn storage(&self) -> Storage<'sto> {
+impl<'env> ReadTxn<'env> {
+    pub(crate) fn storage(&self) -> Storage<'env> {
         self.storage
     }
 
@@ -278,22 +416,18 @@ impl<'sto> ReadTxn<'sto> {
     /// There is (not yet, at least) no way for the environment to know which types are stored in
     /// which of these databases, so you'll need to supply your own type parameters (and they'd
     /// better be correct, or else you'll be reading garbage).
-    pub fn root_db<K: Stored<'sto>, V: Stored<'sto>>(&self, idx: usize) -> Db<'sto, K, V> {
+    pub fn root_db<K: Stored<'env>, V: Stored<'env>>(&self, idx: usize) -> Option<Db<'env, K, V>> {
         let sk_db = if let Some(offset) = self.roots.get(&(1 + idx)) {
-            println!("found a moved root db: offset {:?}", *offset);
-            sanakirja::Db(*offset, std::marker::PhantomData)
+            Some(sanakirja::Db(*offset, std::marker::PhantomData))
         } else {
-            self.storage.root(idx).unwrap()
+            self.storage.root(idx)
         };
-        Db {
-            sk_db: sk_db,
-            storage: self.storage(),
-        }
+        sk_db.map(|db| Db { sk_db: db, storage: self.storage() })
     }
 }
 
-impl<'sto> WriteTxn<'sto> {
-    pub(crate) fn storage(&self) -> Storage<'sto> {
+impl<'env> WriteTxn<'env> {
+    pub(crate) fn storage(&self) -> Storage<'env> {
         self.with_txn(|txn| {
             Storage {
                 base: txn.base(),
@@ -303,61 +437,100 @@ impl<'sto> WriteTxn<'sto> {
         })
     }
 
-    pub(crate) fn allocator<'a>(&'a self) -> Alloc<'a, 'sto> {
+    pub(crate) fn allocator<'a>(&'a self) -> Alloc<'a, 'env> {
         Alloc { txn: self }
     }
 
-    /// Returns a write-only copy of one of the "root" databases in this environment. See
+    /// Returns a write-only view into one of the "root" databases in this environment. See
     /// `ReadTxn::root_db` for more about root databases.
     ///
-    /// *Important*: this is a write-only *copy* of the root database, so any changes you make to
-    /// it won't be reflected in the original database. If you want to actually change the root
-    /// database, you'll want to call `WriteTxn::set_root_sb` after making your changes. Here's an
-    /// example:
+    /// Each root database can be viewed only once at a time. This is enforced at run-time: if you
+    /// call `root_db(0)` while the result of a previous `root_db(0)` is still alive, this function
+    /// will panic. (However, you are allowed to call `root_db(1)` while the result of a previous
+    /// `root_db(0)` is still alive.
+    ///
+    /// Note that you get to specify your own type parameters. The environment doesn't actually
+    /// know what types are stored in its root databases, so you have to provide the correct type
+    /// parameters. If you don't, database corruption awaits!
+    ///
+    /// Because of the way copy-on-write works in sanakirja, it's a bad idea to create multiple
+    /// simultaneous copies of the same root database. If you make two copies and modify them both,
+    /// you could end up with two different modified copies of the root database, living in
+    /// different parts of the backing memory. Since only one of these copies will eventually be
+    /// saved as the new root database, you might end up missing some of the data that you thought
+    /// you had inserted.
+    ///
+    /// # Example
     ///
     /// ```
-    /// # let env = sanakirja_facade::Env::memory_backed(4096 * 10).unwrap();
+    /// # let env = sanakirja_facade::Env::open_anonymous(4096 * 10).unwrap();
     /// # {
-    /// #     let w = env.writer().unwrap();
-    /// #     {
-    /// #         let db = w.create_db::<u64, u64>();
-    /// #         println!("created db {:?}", db);
-    /// #         w.set_root_db(0, db);
-    /// #     }
+    /// #     let mut w = env.writer().unwrap();
+    /// #     w.create_root_db::<u64, u64>(0).unwrap();
     /// #     w.commit().unwrap();
     /// # }
     /// let writer = env.writer().unwrap();
-    /// // Get the first root database. We happen to know that it's a Db<u64, u64>.
-    /// let mut write_db = writer.root_db::<u64, u64>(0);
-    /// write_db.insert(1, 23).unwrap();
+    /// // Since `root_db` borrows the transaction, create a smaller scope for that borrow to live in.
+    /// {
+    ///     // Get the first root database. We happen to know that it's a Db<u64, u64>.
+    ///     let mut write_db = writer.root_db::<u64, u64>(0).unwrap();
+    ///     write_db.insert(&1, &23).unwrap();
+    /// }
     /// let reader = writer.snapshot();
-    /// // Here, we're getting the unmodified Db.
-    /// let read_db = reader.root_db::<u64, u64>(0);
-    /// assert!(read_db.get(&1).is_none());
-    ///
-    /// // Let's try reading again, but first write the modified Db back.
-    /// writer.set_root_db(0, write_db);
-    /// let reader = writer.snapshot();
-    /// // Since we called set_root_db above, we're getting the modified database now.
-    /// let read_db = reader.root_db::<u64, u64>(0);
+    /// let read_db = reader.root_db::<u64, u64>(0).unwrap();
     /// assert!(read_db.get(&1) == Some(23));
     /// ```
-    pub fn root_db<'txn, K: Stored<'sto>, V: Stored<'sto>>(&'txn self, idx: usize) -> WriteDb<'txn, 'sto, K, V> {
-        let sk_db = self.with_txn(|txn| txn.root(idx).unwrap());
-        WriteDb {
-            sk_db: sk_db,
-            txn: self,
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx >= 508`, since there is room for at most 508 root databases.
+    ///
+    /// Panics if you try to access a root database that is already being accessed.
+    /// ```
+    pub fn root_db<'txn, K: Stored<'env>, V: Stored<'env>>(&'txn self, idx: usize) -> Option<RootWriteDb<'txn, 'env, K, V>> {
+        let sk_db = self.with_txn(|txn| txn.root(idx));
+        if !self.borrowed_roots.borrow_mut().insert(idx) {
+            panic!("tried to borrow root {:?} multiple times", idx);
         }
+        sk_db.map(|db| {
+            RootWriteDb {
+                idx: idx,
+                db: WriteDb {
+                    sk_db: db,
+                    txn: self,
+                }
+            }
+        })
     }
 
     /// Creates a new write-only database.
-    pub fn create_db<'txn, K: Stored<'sto>, V: Stored<'sto>>(&'txn self) -> WriteDb<'txn, 'sto, K, V> {
-        // TODO: this can fail if there's not enough space
-        let sk_db = self.with_mut_txn(|txn| txn.create_db().unwrap());
-        WriteDb {
+    pub fn create_db<'txn, K: Stored<'env>, V: Stored<'env>>(&'txn self)
+    -> Result<WriteDb<'txn, 'env, K, V>> {
+        let sk_db = self.with_mut_txn(|txn| txn.create_db())?;
+        Ok(WriteDb {
             sk_db: sk_db,
             txn: self,
+        })
+    }
+
+    /// Creates a new write-only database, anchored at the environment root.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `idx >= 508`, since there is room for at most 508 root databases.
+    ///
+    /// Panics if the index points to another existing database, which is currently being accessed.
+    pub fn create_root_db<'txn, K: Stored<'env>, V: Stored<'env>>(&'txn self, idx: usize)
+    -> Result<RootWriteDb<'txn, 'env, K, V>> {
+        let ret = RootWriteDb {
+            db: self.create_db()?,
+            idx: idx,
+        };
+        self.set_root_db(idx, &ret.db);
+        if !self.borrowed_roots.borrow_mut().insert(idx) {
+            panic!("tried to create root {:?}, but it is being accessed", idx);
         }
+        Ok(ret)
     }
 
     /// Designates `db` as a "root" database. See `ReadTxn::root_db` for more about root databases.
@@ -365,7 +538,7 @@ impl<'sto> WriteTxn<'sto> {
     /// # Panics
     ///
     /// Panics if `idx >= 508`, since there is room for at most 508 root databases.
-    pub fn set_root_db<'txn, K: Stored<'sto>, V: Stored<'sto>>(&self, idx: usize, db: WriteDb<'txn, 'sto, K, V>) {
+    fn set_root_db<'txn, K: Stored<'env>, V: Stored<'env>>(&self, idx: usize, db: &WriteDb<'txn, 'env, K, V>) {
         self.with_mut_txn(|txn| txn.set_root(idx, db.sk_db));
     }
 
@@ -388,7 +561,6 @@ impl<'sto> WriteTxn<'sto> {
     /// subsequent changes won't be.
     pub fn snapshot<'a>(&'a self) -> ReadTxn<'a> {
         let roots = self.with_txn(|t| t.roots.clone());
-        println!("creating snapshot. roots {:?}", roots);
         // This scope ensures that we drop txn_ref before calling self.storage(), which needs to
         // borrow self.sk_txn.
         {
@@ -414,7 +586,7 @@ impl<'sto> WriteTxn<'sto> {
     }
 
     pub(crate) fn with_mut_txn<F, Out>(&self, f: F) -> Out
-    where F: FnOnce(&mut sanakirja::MutTxn<'sto>) -> Out
+    where F: FnOnce(&mut sanakirja::MutTxn<'env>) -> Out
     {
         match *self.sk_txn.borrow_mut() {
             WrappedTxn::Empty => panic!("we should never have an empty transaction"),
@@ -424,7 +596,7 @@ impl<'sto> WriteTxn<'sto> {
     }
 
     pub(crate) fn with_txn<F, Out>(&self, f: F) -> Out
-    where F: FnOnce(&sanakirja::MutTxn<'sto>) -> Out
+    where F: FnOnce(&sanakirja::MutTxn<'env>) -> Out
     {
         match *self.sk_txn.borrow() {
             WrappedTxn::Empty => panic!("we should never have an empty transaction"),
@@ -433,9 +605,10 @@ impl<'sto> WriteTxn<'sto> {
         }
     }
 
-    pub(crate) fn from_mut_ref(txn: &mut sanakirja::MutTxn<'sto>) -> WriteTxn<'sto> {
+    pub(crate) fn from_mut_ref(txn: &mut sanakirja::MutTxn<'env>) -> WriteTxn<'env> {
         WriteTxn {
-            sk_txn: RefCell::new(WrappedTxn::Borrowed(txn as *mut _))
+            sk_txn: RefCell::new(WrappedTxn::Borrowed(txn as *mut _)),
+            borrowed_roots: RefCell::new(HashSet::new()),
         }
     }
 }
