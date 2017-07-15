@@ -25,11 +25,91 @@
 //!
 //! # Using
 //!
+//! ## The weakly typed interface
+//!
+//! There are two interfaces to `sanakirja_facade`, one of which is more strongly typed than the
+//! other. We'll start by describing the weakly typed interface, because the concepts involved are
+//! also useful for understanding the strongly typed interface.
+//!
+//! The weakly typed interface is built around the [`Env`][Env], [`ReadTxn`][ReadTxn], and
+//! [`WriteTxn`][WriteTxn] types, but if you only want to read from the database then you only need
+//! the first two. An `Env` (pronounced "environment") contains a bunch of "root databases," each
+//! of which is basically an ordered map. To get read access to these databases, we need to open a
+//! `ReadTxn` (pronounced, "read transaction"); to get write access, we need to open a `WriteTxn`
+//! ("write transaction").
+//!
+//! Here's an example where we open an environment for reading only.
+//!
+//! ```
+//! # extern crate sanakirja_facade;
+//! # use sanakirja_facade::*;
+//!
+//! # fn main() {
+//!     // Read an Env from a file (commented out, because you should supply your own path).
+//!     // let env = Env::open("my_db").expect("couldn't open env");
+//!     # let env = Env::open_anonymous(PAGE_SIZE * 100).unwrap();
+//!     # {
+//!     #     let writer = env.writer().unwrap();
+//!     #     writer.create_root_db::<u64,u64>(0).unwrap().insert(&1, &2).unwrap();
+//!     #     writer.commit().unwrap();
+//!     # }
+//!     let reader = env.reader().unwrap();
+//!     // We happen to know that the root database number zero is a map from `u64` to `u64`.
+//!     let db = reader.root_db::<u64, u64>(0).unwrap();
+//!     println!("{:?}", db.get(&1));
+//! # }
+//! ```
+//!
+//! The main issue with the weakly typed interface is that every time we access a root database, we
+//! need to tell sanakirja which types we expect it to contain. Sanakirja can't help us if we get
+//! it wrong: if we had said `<u32, u32>` instead of `<u64, u64>`, sanakirja wouldn't have known
+//! enough to complain. Instead we would have gotten back a map containing garbage data.
+//!
+//! Anyway, let's talk about writing and how it interacts with reading. You open a writer with the
+//! [`Env::writer`][Env::writer] method. From there, you can open existing root databases using
+//! [`WriteTxn::root_db`][WriteTxn::root_db] or create new ones using
+//! [`WriteTxn::create_root_db`][WriteTxn::create_root_db]. Then you can modify those databases by
+//! adding or deleting entries.
+//!
+//! The crucial point about `WriteTxn`s is that any modifications you make are invisible to any
+//! active `ReadTxn`s. This is a consequence of sanakirja's transactional design: all of the
+//! changes you make in a `WriteTxn` are batched up, and only actually written when you call
+//! [`WriteTxn::commit`][WriteTxn::commit].
+//!
+//! ```
+//! # extern crate sanakirja_facade;
+//! # use sanakirja_facade::*;
+//!
+//! # fn main() {
+//!     // Create an empty environment, not backed by any file.
+//!     let env = Env::open_anonymous(PAGE_SIZE * 100).unwrap();
+//!     let writer = env.writer().unwrap();
+//!     {   // Make a new scope for creating a root database, since our reference
+//!         // to the root database needs to go out of scope before we commit our
+//!         // transaction.
+//!         let mut db = writer.create_root_db::<u64, u64>(0).unwrap();
+//!         db.insert(&1, &2);
+//!
+//!         // None of the changes we just did can be seen by a `ReadTxn`: it doesn't
+//!         // even think there are any root databases yet.
+//!         let reader = env.reader().unwrap();
+//!         assert!(reader.root_db::<u64, u64>(0).is_none());
+//!     }
+//!     // Now commit the writer. Readers that we create after this will see the changes.
+//!     writer.commit();
+//!     let reader = env.reader().unwrap();
+//!     let db = reader.root_db::<u64, u64>(0).unwrap();
+//!     assert_eq!(db.get(&1), Some(2));
+//! # }
+//! ```
+//!
 //! ## The strongly typed interface
 //!
-//! There are two interfaces to `sanakirja_facade`, one of which is more strongly-typed than the
-//! other. To use the strongly typed interface, you will need to add a dependency on the
-//! `sanakirja_facade_derive` crate, possibly by adding
+//! The strongly typed interface has one major advantage over the weakly typed one: you don't have
+//! to remember, every time you open a root database, what types are stored in it. Instead, you
+//! declare the types once, and sanakirja_facade will generate typesafe wrappers for you.  To use
+//! the strongly typed interface, you will need to add a dependency on the
+//! `sanakirja_facade_derive` crate, by adding
 //!
 //! ```text
 //! [dependencies]
@@ -50,16 +130,16 @@
 //! # #[macro_use] extern crate sanakirja_facade_derive;
 //! use sanakirja_facade::*;
 //!
-//! // This #[derive(TypedEnv)] creates three new structs: `MyEnv`, `MyReader`, and `MyWriter`.
+//! // This #[derive(TypedEnv)] creates three new structs: `MyEnv`, `MyReadTxn`, and `MyWriteTxn`.
 //! //
-//! // `MyEnv` is a bit like `Env`, except that the `reader()` function returns a `MyReader` and
-//! // the `writer()` function returns a `MyWriter`.
+//! // `MyEnv` is a bit like `Env`, except that the `reader()` function returns a `MyReadTxn` and
+//! // the `writer()` function returns a `MyWriteTxn`.
 //! //
-//! // `MyReader` is a bit like `ReadTxn`, except that instead of accessing the root databases
+//! // `MyReadTxn` is a bit like `ReadTxn`, except that instead of accessing the root databases
 //! // using numeric indices, there are non-generic, named functions for accessing both of the
 //! // root databases that we declare below.
 //! //
-//! // `MyWriter` is a bit like `WriteTxn`, except that it also uses named functions instead of
+//! // `MyWriteTxn` is a bit like `WriteTxn`, except that it also uses named functions instead of
 //! // indices for accessing the root databases.
 //! #[derive(TypedEnv)]
 //! struct MySchema<'env> {
@@ -70,8 +150,7 @@
 //! }
 //!
 //! fn main() {
-//!     // Create an empty, memory-backed database. You can also use `MyEnv::open` to open or
-//!     // create a file-backed one.
+//!     // Create an empty, memory-backed database.
 //!     let env = MyEnv::open_anonymous(PAGE_SIZE * 100).unwrap();
 //!     let writer = env.writer().unwrap();
 //!     writer.my_first_db().insert(&123, &b"Here's a buffer with text in it."[..]).unwrap();
@@ -83,25 +162,29 @@
 //!
 //!     // If we were to call env.reader(), it would look as though our database were empty.
 //!     // That's because of sanakirja's transactional approach. If we want to actually see
-//!     // the data that // we just inserted, we can either call `writer.snapshot()` to get
+//!     // the data that we just inserted, we can either call `writer.snapshot()` to get
 //!     // a reader with a snapshot of the current state, or we can call `writer.commit()` to
 //!     // finish our transaction before getting a reader with `env.reader()`. Let's do the
 //!     // first option:
 //!     let reader = writer.snapshot();
 //!     let buf = reader.my_first_db().get(&123).unwrap();
-//!     //assert_eq!(buf.iter().next().unwrap(), &b"Here's a buffer with text in it."[..]);
-//!     //let db = reader.my_nested_db().get(&234).unwrap();
-//!     //assert_eq!(db.get(&7), Some(8));
+//!     assert_eq!(buf.iter().next().unwrap(), &b"Here's a buffer with text in it."[..]);
+//!     let db = reader.my_nested_db().get(&234).unwrap();
+//!     assert_eq!(db.get(&7), Some(8));
 //! }
 //! ```
-//!
-//! ## The weakly typed interface
-//!
-//! This section is not written yet...
 //!
 //! # Extending
 //!
 //! This section is not written yet...
+//!
+//! [Env]: struct.Env.html
+//! [Env::writer]: struct.Env.html#method.writer
+//! [ReadTxn]: struct.ReadTxn.html
+//! [WriteTxn]: struct.WriteTxn.html
+//! [WriteTxn::commit]: struct.WriteTxn.html#method.commit
+//! [WriteTxn::root_db]: struct.WriteTxn.html#method.root_db
+//! [WriteTxn::create_root_db]: struct.WriteTxn.html#method.create_root_db
 
 extern crate byteorder;
 extern crate rand;
@@ -354,9 +437,18 @@ impl Env {
 
     /// Opens the environment stored in `path`, which should point to a directory.
     ///
-    /// `max_length` specifies the maximum size (in bytes) that the database may grow to. This can
-    /// be made very large without any performance penalty.
-    pub fn open<P: AsRef<Path>>(path: P, max_length: usize) -> Result<Env> {
+    /// This method is mainly for read-only access, since the returned environment may not have any
+    /// free space for modifications.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Env> {
+        Env::open_and_grow_to(path, 0)
+    }
+
+    /// Opens the environment stored in `path`, which should point to a directory.
+    ///
+    /// If `max_length` is larger than the current size of the environment, the environment will
+    /// grow to `max_length`. Because of the way memory-mapped files work, this can be made very
+    /// large without any performance penalty.
+    pub fn open_and_grow_to<P: AsRef<Path>>(path: P, max_length: usize) -> Result<Env> {
         Ok(Env {
             sk_env: Box::new(sanakirja::Env::new(path, max_length as u64)?)
         })

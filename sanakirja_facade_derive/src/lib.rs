@@ -82,8 +82,8 @@ fn expand_typed_env(ast: &syn::DeriveInput) -> quote::Tokens {
     }).collect::<Vec<_>>();
 
     let vis = &ast.vis;
-    let reader_ident = syn::Ident::new(name.clone() + "Reader");
-    let writer_ident = syn::Ident::new(name.clone() + "Writer");
+    let reader_ident = syn::Ident::new(name.clone() + "ReadTxn");
+    let writer_ident = syn::Ident::new(name.clone() + "WriteTxn");
     let env_ident = syn::Ident::new(name.clone() + "Env");
 
     quote! {
@@ -127,10 +127,10 @@ fn expand_typed_env(ast: &syn::DeriveInput) -> quote::Tokens {
         }
 
         impl #env_ident {
-            #vis fn open<P: AsRef<::std::path::Path>>(path: P, max_length: usize)
+            #vis fn open_and_grow_to<P: AsRef<::std::path::Path>>(path: P, max_length: usize)
             -> ::sanakirja_facade::Result<#env_ident> {
                 let mut ret = #env_ident {
-                    env: ::sanakirja_facade::Env::open(path, max_length)?
+                    env: ::sanakirja_facade::Env::open_and_grow_to(path, max_length)?
                 };
 
                 let mut all_present = true;
@@ -151,6 +151,11 @@ fn expand_typed_env(ast: &syn::DeriveInput) -> quote::Tokens {
                 }
 
                 Ok(ret)
+            }
+
+            #vis fn open<P: AsRef<::std::path::Path>>(path: P)
+            -> ::sanakirja_facade::Result<#env_ident> {
+                #env_ident::open_and_grow_to(path, 0)
             }
 
             fn create_dbs<#env_lifetime>(&#env_lifetime mut self) -> ::sanakirja_facade::Result<()> {

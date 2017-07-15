@@ -49,7 +49,7 @@ impl<'sto> Iterator for LargeBufIter<'sto> {
             let buf = self.storage.get_page(self.next_page);
             self.next_page = LittleEndian::read_u64(buf).try_into().unwrap();
             self.remaining_len -= chunk_len;
-            Some(&buf[8..])
+            Some(&buf[8..(8 + chunk_len)])
         }
     }
 }

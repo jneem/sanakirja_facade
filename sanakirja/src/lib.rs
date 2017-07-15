@@ -916,6 +916,7 @@ impl<'env> MutTxn<'env> {
                                                             db: &Db<K, V>)
                                                             -> Result<(), Error> {
         debug!("DROP ! {:?}", db.0);
+        // TODO(jneem): understand this. Are the pages used by the Db itself ever freed?
         let page = self.load_cow_page(db.0);
         for (_, k, r) in page.iter_all::<K,V>() {
             if let Some((k,v)) = k {
