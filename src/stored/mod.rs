@@ -1,4 +1,3 @@
-use byteorder::{ByteOrder, LittleEndian};
 use rand::Rng;
 use sanakirja;
 use sanakirja::LoadPage;
@@ -9,6 +8,8 @@ use std::marker::PhantomData;
 
 use PAGE_SIZE;
 use {Alignment, Alloc, WriteTxn, Result, Storage};
+
+mod primitives;
 
 /// Objects that are stored in the database often need to store some important metadata along with
 /// them. This trait represents that metadata.
@@ -80,33 +81,6 @@ pub trait Stored<'sto>: Storable<'sto, Self> + Sized {
 /// identical to the format that `T` expects. Otherwise, you'll probably get database corruption.
 pub trait Storable<'sto, T>: PartialOrd<T> {
     fn store<'a>(&self, alloc: &mut Alloc<'a, 'sto>) -> Result<T>;
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct U64StoredHeader {}
-
-impl StoredHeader for U64StoredHeader {
-    type PageOffsets = std::iter::Empty<u64>;
-    fn onpage_size(&self) -> u16 { 8 }
-    fn page_offsets(&self) -> Self::PageOffsets { std::iter::empty() }
-}
-
-impl<'sto> Storable<'sto, u64> for u64 {
-    fn store(&self, _: &mut Alloc) -> Result<u64> { Ok(*self) }
-}
-
-impl<'sto> Stored<'sto> for u64 {
-    type Header = U64StoredHeader;
-    fn header(&self) -> U64StoredHeader { U64StoredHeader {} }
-    fn read_header(_: &[u8]) -> U64StoredHeader { U64StoredHeader {} }
-    fn drop_value(&self, _: &mut Alloc) -> Result<()> { Ok(()) }
-    fn alignment() -> Alignment { Alignment::B8 }
-    fn read_value(buf: &[u8], _: &Storage<'sto>) -> u64 {
-        LittleEndian::read_u64(buf)
-    }
-    fn write_value(&self, buf: &mut [u8]) {
-        LittleEndian::write_u64(buf, *self)
-    }
 }
 
 // Wrap a Stored in a Wrapper to make it sanakirja::Representable.

@@ -200,13 +200,13 @@ use std::path::Path;
 
 mod buf;
 mod db;
-mod representable;
+mod stored;
 
-use representable::Wrapper;
+use stored::Wrapper;
 
 pub use buf::LargeBuf;
 pub use db::{Db, RootWriteDb, WriteDb};
-pub use representable::{StoredHeader, Storable, Stored};
+pub use stored::{StoredHeader, Storable, Stored};
 pub use sanakirja::Alignment;
 pub type Error = sanakirja::Error;
 pub type Result<T> = std::result::Result<T, Error>;
