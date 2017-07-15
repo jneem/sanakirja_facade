@@ -26,6 +26,9 @@ pub trait StoredHeader: Copy {
 /// else it will be costly to read and write them. However, since they can also store references
 /// into the database, you can implement `Stored` for a "reference" into a large buffer that is
 /// stored in the database.
+///
+/// If you want to store custom datatypes in your sanakirja database, this is the main trait that
+/// you need to implement.
 pub trait Stored<'sto>: Storable<'sto, Self> + Sized {
     /// This is the metadata associated with this type.
     type Header: StoredHeader;
@@ -62,7 +65,7 @@ pub trait Stored<'sto>: Storable<'sto, Self> + Sized {
 
 /// When the type `S` implements `Storable<T>`, it means that we can write `S` into a database that
 /// expects to store `T`. For example, `LargeBuf` is a large buffer that's stored in the database,
-/// and `[u8]` implements `Writable<LargeBuf>`, since it's sometimes useful to take a buffer
+/// and `[u8]` implements `Storable<LargeBuf>`, since it's sometimes useful to take a buffer
 /// outside the database and write it to the database.
 ///
 /// `Storable<T>` requires `PartialOrd<T>`, because if you want to write something into a database
@@ -241,7 +244,9 @@ T: Storable<'sto, S> + ?Sized,
                 (*ptr).write_value(mk_mut_slice(p, (*ptr).onpage_size() as usize));
             },
             Wrapper::OnPage { ptr, .. } => {
-                // TODO: explain this
+                // This means that the thing we want to write is already stored in the database
+                // somewhere. However it was represented before, we can just copy that
+                // representation to the new location.
                 std::ptr::copy_nonoverlapping(ptr, p, self.onpage_size() as usize);
             },
             Wrapper::Searcher { .. } => {
